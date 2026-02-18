@@ -68,6 +68,12 @@ Reload your shell: `source ~/.zshrc`. Now use `app_logs` instead of the full pat
 
 ## Examples
 
+To discover available app names in your cluster, run:
+
+```bash
+kubectl get pods -o jsonpath='{.items[*].metadata.labels.app}' | tr ' ' '\n' | sort | uniq
+```
+
 - Tail real-time logs from `agent-service` and `tez-api`:
   ```bash
   ./tail_multiple_logs.sh agent-service tez-api
@@ -133,16 +139,6 @@ Each log line is prefixed with `[pod:container]` for easy identification:
 
 > **Tip**: This output file can be shared with GitHub Copilot or other AI tools to analyze and correlate errors across pods—no need to manually cross-reference logs from different terminals.
 > <img width="1680" height="1050" alt="Screenshot 2026-02-18 at 11 33 35 PM" src="https://github.com/user-attachments/assets/0b9088d6-9db3-48a8-bf89-8bf143832bb6" />
-
-
-
-## Getting Pod App List
-
-To discover available app names in your cluster, run:
-
-```bash
-kubectl get pods -o jsonpath='{.items[*].metadata.labels.app}' | tr ' ' '\n' | sort | uniq
-```
 
 This lists unique app labels from all pods, helping you identify apps to monitor.
 
