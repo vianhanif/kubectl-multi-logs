@@ -2,9 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,9 +29,24 @@ const (
 	ansiBold   = "\033[1m"
 	ansiDim    = "\033[2m"
 	ansiClearL = "\033[K"
+	ansiRed    = "\033[31m"
 )
 
 var braille = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// appColorPalette provides distinct colors cycled per-app in the display.
+var appColorPalette = []string{
+	"\033[34m", // blue
+	"\033[35m", // magenta
+	"\033[33m", // yellow
+	"\033[96m", // bright cyan
+	"\033[95m", // bright magenta
+	"\033[94m", // bright blue
+	"\033[93m", // bright yellow
+	"\033[92m", // bright green
+	"\033[91m", // bright red
+	"\033[31m", // red
+}
 
 func termWidth() int {
 	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
@@ -57,6 +72,14 @@ func rightPad(left, right string, width int) string {
 		pad = 1
 	}
 	return left + strings.Repeat(" ", pad) + right
+}
+
+// truncate shortens s to at most n bytes, appending "..." if cut.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // ─── Phase monitor (finding pods / fetching containers) ──────────────────────
@@ -168,14 +191,17 @@ func getContainersForPod(pod, namespace string) ([]string, error) {
 // streamState tracks live stats for one pod/container log stream.
 type streamState struct {
 	app, pod, container string
-	count               int64 // updated atomically
-	done                int32 // 1 when kubectl exits, set atomically
+	count               int64  // updated atomically
+	done                int32  // 1 when kubectl exits, set atomically
+	errMsg              string // written once before markDone; safe to read after isDone
 }
 
-func (s *streamState) addLines(n int64) { atomic.AddInt64(&s.count, n) }
-func (s *streamState) markDone()        { atomic.StoreInt32(&s.done, 1) }
-func (s *streamState) isDone() bool     { return atomic.LoadInt32(&s.done) == 1 }
-func (s *streamState) lineCount() int64 { return atomic.LoadInt64(&s.count) }
+func (s *streamState) addLines(n int64)    { atomic.AddInt64(&s.count, n) }
+func (s *streamState) markDone()           { atomic.StoreInt32(&s.done, 1) }
+func (s *streamState) isDone() bool        { return atomic.LoadInt32(&s.done) == 1 }
+func (s *streamState) lineCount() int64    { return atomic.LoadInt64(&s.count) }
+func (s *streamState) setError(msg string) { s.errMsg = msg }
+func (s *streamState) isFailed() bool      { return s.errMsg != "" }
 
 // ─── Log streaming ────────────────────────────────────────────────────────────
 
@@ -191,13 +217,16 @@ func streamLogs(st *streamState, follow bool, since, namespace, grepPattern stri
 	}
 	args = append(args, st.pod, "-c", st.container)
 
+	var stderrBuf bytes.Buffer
 	cmd := exec.Command("kubectl", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		st.setError(fmt.Sprintf("stdout pipe: %v", err))
 		return
 	}
-	cmd.Stderr = io.Discard
+	cmd.Stderr = &stderrBuf
 	if err := cmd.Start(); err != nil {
+		st.setError(fmt.Sprintf("start: %v", err))
 		return
 	}
 
@@ -238,7 +267,13 @@ func streamLogs(st *streamState, follow bool, since, namespace, grepPattern stri
 		st.addLines(batch)
 	}
 
-	cmd.Wait() //nolint:errcheck
+	if err := cmd.Wait(); err != nil && st.lineCount() == 0 {
+		msg := strings.TrimSpace(stderrBuf.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		st.setError(truncate(msg, 120))
+	}
 }
 
 // ─── Display monitor (Phase 3) ────────────────────────────────────────────────
@@ -255,6 +290,16 @@ func displayMonitor(streams []*streamState, since string) {
 		}
 		return sorted[i].pod < sorted[j].pod
 	})
+
+	// Assign a consistent color to each app (in sorted order)
+	appColorMap := map[string]string{}
+	colorIdx := 0
+	for _, st := range sorted {
+		if _, ok := appColorMap[st.app]; !ok {
+			appColorMap[st.app] = appColorPalette[colorIdx%len(appColorPalette)]
+			colorIdx++
+		}
+	}
 
 	total := len(sorted)
 	printedApp := map[string]bool{}
@@ -274,29 +319,40 @@ func displayMonitor(streams []*streamState, since string) {
 			if printedStream[i] || !st.isDone() {
 				continue
 			}
-			// Print app header once
+			appColor := appColorMap[st.app]
+			// Print app header once, in the app's color
 			if !printedApp[st.app] {
-				printPermanent(fmt.Sprintf("  %s%s%s", ansiBold, st.app, ansiReset))
+				printPermanent(fmt.Sprintf("  %s%s%s%s", appColor, ansiBold, st.app, ansiReset))
 				printedApp[st.app] = true
 			}
-			cols := termWidth()
-			leftVis := fmt.Sprintf("    ✔ [%s] %s", st.pod, st.container)
-			rightVis := fmt.Sprintf("Collected   %d lines", st.lineCount())
-			if since == "" {
-				rightVis = fmt.Sprintf("Following   %d lines", st.lineCount())
+			if st.isFailed() {
+				printPermanent(fmt.Sprintf(
+					"    %s✗%s [%s%s%s] %s  %s%s%s",
+					ansiRed, ansiReset,
+					appColor, st.pod, ansiReset,
+					st.container,
+					ansiDim, truncate(st.errMsg, 60), ansiReset,
+				))
+			} else {
+				cols := termWidth()
+				leftVis := fmt.Sprintf("    ✔ [%s] %s", st.pod, st.container)
+				rightVis := fmt.Sprintf("Collected   %d lines", st.lineCount())
+				if since == "" {
+					rightVis = fmt.Sprintf("Following   %d lines", st.lineCount())
+				}
+				pad := cols - len(leftVis) - len(rightVis)
+				if pad < 1 {
+					pad = 1
+				}
+				printPermanent(fmt.Sprintf(
+					"    %s✔%s [%s%s%s] %s%s%s%s%s",
+					ansiGreen, ansiReset,
+					appColor, st.pod, ansiReset,
+					st.container,
+					strings.Repeat(" ", pad),
+					ansiDim, rightVis, ansiReset,
+				))
 			}
-			pad := cols - len(leftVis) - len(rightVis)
-			if pad < 1 {
-				pad = 1
-			}
-			printPermanent(fmt.Sprintf(
-				"    %s✔%s [%s%s%s] %s%s%s%s%s",
-				ansiGreen, ansiReset,
-				ansiCyan, st.pod, ansiReset,
-				st.container,
-				strings.Repeat(" ", pad),
-				ansiDim, rightVis, ansiReset,
-			))
 			printedStream[i] = true
 			doneCount++
 		}
@@ -314,6 +370,62 @@ func displayMonitor(streams []*streamState, since string) {
 		}
 	}
 	fmt.Printf("\r%s", ansiClearL)
+}
+
+// ─── Summary ─────────────────────────────────────────────────────────────────
+
+// printSummary prints a per-app table of pods, streams, and lines collected.
+func printSummary(streams []*streamState) {
+	if len(streams) == 0 {
+		return
+	}
+
+	type appStat struct {
+		pods       map[string]bool
+		containers int
+		lines      int64
+		errors     int
+	}
+	stats := map[string]*appStat{}
+	var appOrder []string
+
+	for _, st := range streams {
+		if _, ok := stats[st.app]; !ok {
+			stats[st.app] = &appStat{pods: map[string]bool{}}
+			appOrder = append(appOrder, st.app)
+		}
+		s := stats[st.app]
+		s.pods[st.pod] = true
+		s.containers++
+		s.lines += st.lineCount()
+		if st.isFailed() {
+			s.errors++
+		}
+	}
+	sort.Strings(appOrder)
+
+	totalPods, totalContainers, totalLines := 0, 0, int64(0)
+	for _, s := range stats {
+		totalPods += len(s.pods)
+		totalContainers += s.containers
+		totalLines += s.lines
+	}
+
+	sep := "  " + strings.Repeat("─", 66)
+	fmt.Printf("\n%s── Summary ──────────────────────────────────────────────────────%s\n", ansiBold, ansiReset)
+	fmt.Printf("  %-38s  %4s  %8s  %10s\n", "App", "Pods", "Streams", "Lines")
+	fmt.Println(sep)
+	for _, app := range appOrder {
+		s := stats[app]
+		errMark := ""
+		if s.errors > 0 {
+			errMark = fmt.Sprintf("  %s(%d err)%s", ansiRed, s.errors, ansiReset)
+		}
+		fmt.Printf("  %-38s  %4d  %8d  %10d%s\n",
+			app, len(s.pods), s.containers, s.lines, errMark)
+	}
+	fmt.Println(sep)
+	fmt.Printf("  %-38s  %4d  %8d  %10d\n", "TOTAL", totalPods, totalContainers, totalLines)
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -457,12 +569,17 @@ func main() {
 	fmt.Println("----------------------------------------")
 
 	// ── Set up signal handler for clean shutdown ────────────────────────────
+	var streamsStore atomic.Value // stores []*streamState once Phase 3 is ready
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Printf("\n%sCtrl+C received — stopping all log streams...%s\n", ansiYellow, ansiReset)
+		fmt.Printf("\r%s\n%sCtrl+C received — stopping all log streams...%s\n",
+			ansiClearL, ansiYellow, ansiReset)
 		outFile.Close()
+		if v := streamsStore.Load(); v != nil {
+			printSummary(v.([]*streamState))
+		}
 		os.Exit(0)
 	}()
 
@@ -498,12 +615,16 @@ func main() {
 		}
 	}
 
+	// Publish streams for the signal handler before starting the monitor
+	streamsStore.Store(streams)
+
 	// Run display monitor in foreground; wait for all streams after
 	close(prepDone)
 	displayMonitor(streams, *since)
 	wg3.Wait()
 
+	printSummary(streams)
 	if *since != "" {
-		fmt.Printf("\nHistorical logs collection completed. Logs saved to: %s\n", outPath)
+		fmt.Printf("Historical logs collection completed. Logs saved to: %s\n", outPath)
 	}
 }
