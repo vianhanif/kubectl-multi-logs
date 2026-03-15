@@ -44,11 +44,11 @@ func newPW() progress.Writer {
 		Error:   text.Colors{text.FgRed},
 		Stats:   text.Colors{text.FgHiBlack},
 		Time:    text.Colors{text.FgHiBlack},
-		Tracker: text.Colors{text.FgHiBlack},
+		Tracker: text.Colors{text.FgGreen},
 		Value:   text.Colors{text.FgHiBlack},
 		Speed:   text.Colors{text.FgHiBlack},
 	}
-	pw.Style().Chars.Finished = "✔"
+	pw.Style().Chars.Finished = "█"
 	pw.Style().Options.DoneString = ""
 	pw.Style().Options.ErrorString = ""
 	pw.Style().Visibility = progress.StyleVisibility{
