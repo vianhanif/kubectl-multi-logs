@@ -485,8 +485,9 @@ var summaryTableStyle = table.Style{
 	},
 }
 
-// printSummary prints a per-app breakdown with per-container detail,
-// including line counts and first/last log timestamps, using go-pretty/table.
+// printSummary prints a single unified table for all apps/pods/containers,
+// with an aggregate row per app group (AutoMerge on the APP column keeps the
+// app name visible once per group) and a grand-total footer.
 func printSummary(streams []*streamState) {
 	if len(streams) == 0 {
 		return
@@ -540,54 +541,64 @@ func printSummary(streams []*streamState) {
 
 	fmt.Println()
 	fmt.Println(text.Bold.Sprint("── Summary"))
+	fmt.Println()
 
-	for _, app := range appOrder {
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.SetStyle(summaryTableStyle)
+	// APP column uses AutoMerge so the app name spans the aggregate row + all
+	// stream rows for that app — each group is fenced by AppendSeparator().
+	t.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 1, Align: text.AlignCenter},
+		{Number: 2, Align: text.AlignLeft, AutoMerge: true, Colors: text.Colors{text.Bold}},
+		{Number: 3, Align: text.AlignLeft},
+		{Number: 4, Align: text.AlignLeft},
+		{Number: 5, Align: text.AlignRight},
+		{Number: 6, Align: text.AlignCenter},
+	})
+	t.AppendHeader(table.Row{" ", "APP", "POD", "CONTAINER", "LINES", "TIME RANGE"})
+
+	for i, app := range appOrder {
 		g := groups[app]
 
-		// Strip the common pod-name prefix to keep POD column narrow.
+		// Strip common pod-name prefix to keep the POD column narrow.
 		allPodNames := make([]string, len(g.containers))
-		for i, st := range g.containers {
-			allPodNames[i] = st.pod
+		for j, st := range g.containers {
+			allPodNames[j] = st.pod
 		}
 		podPrefix := longestCommonPrefix(allPodNames)
 		if len(podPrefix) > 0 && len(podPrefix) >= len(allPodNames[0])-1 {
 			podPrefix = ""
 		}
 
-		// App section header.
-		errSuffix := ""
-		if g.errors > 0 {
-			errSuffix = "  " + text.FgRed.Sprintf("(%d err)", g.errors)
-		}
-		timeoutSuffix := ""
-		if g.timedOuts > 0 {
-			timeoutSuffix = "  " + text.FgYellow.Sprintf("(%d timed out)", g.timedOuts)
-		}
-		fmt.Printf("\n  %s  %s%s%s\n",
-			text.Bold.Sprint(app),
-			text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s) · %d lines", len(g.pods), len(g.containers), g.lines),
-			errSuffix,
-			timeoutSuffix,
-		)
+		// Build aggregate note for the group header row.
+		aggNote := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s)", len(g.pods), len(g.containers))
 		if podPrefix != "" {
-			fmt.Printf("  %s\n", text.FgHiBlack.Sprintf("pod prefix: %s", podPrefix))
+			aggNote += text.FgHiBlack.Sprintf("  ·  prefix: %s…", podPrefix)
 		}
+		var notices []string
+		if g.errors > 0 {
+			notices = append(notices, text.FgRed.Sprintf("%d err", g.errors))
+		}
+		if g.timedOuts > 0 {
+			notices = append(notices, text.FgYellow.Sprintf("%d timed out", g.timedOuts))
+		}
+		noticeStr := strings.Join(notices, "  ")
 
-		// Per-app table.
-		t := table.NewWriter()
-		t.SetOutputMirror(os.Stdout)
-		t.SetStyle(summaryTableStyle)
-		t.SetColumnConfigs([]table.ColumnConfig{
-			{Number: 1, Align: text.AlignLeft},                                        // icon
-			{Number: 2, Align: text.AlignLeft, Colors: text.Colors{text.FgCyan}},      // pod
-			{Number: 3, Align: text.AlignLeft, Colors: text.Colors{text.FgCyan}},      // container
-			{Number: 4, Align: text.AlignRight, Colors: text.Colors{text.FgHiWhite}},  // lines
-			{Number: 5, Align: text.AlignCenter, Colors: text.Colors{text.FgHiBlack}}, // time range
+		// Aggregate row — APP value here is the same string used in stream
+		// rows so AutoMerge collapses them into one spanning cell.
+		t.AppendRow(table.Row{
+			"",
+			app,
+			aggNote,
+			"",
+			text.FgHiBlack.Sprint(g.lines),
+			noticeStr,
 		})
-		t.AppendHeader(table.Row{" ", "POD", "CONTAINER", "LINES", "TIME RANGE"})
 
-		for i, st := range g.containers {
-			shortPod := strings.TrimPrefix(allPodNames[i], podPrefix)
+		// Individual stream rows.
+		for j, st := range g.containers {
+			shortPod := strings.TrimPrefix(allPodNames[j], podPrefix)
 			var icon string
 			if st.isFailed() {
 				icon = text.FgRed.Sprint("✗")
@@ -598,33 +609,41 @@ func printSummary(streams []*streamState) {
 			}
 			timeRange := ""
 			if !st.startedAt.IsZero() {
-				timeRange = fmt.Sprintf("%s → %s",
+				timeRange = text.FgHiBlack.Sprintf("%s → %s",
 					st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
 				if st.isTimedOut() {
-					timeRange += " (cut)"
+					timeRange += text.FgYellow.Sprint(" (cut)")
 				}
 			} else if st.isFailed() {
-				timeRange = truncate(st.errMsg, 30)
+				timeRange = text.FgRed.Sprint(truncate(st.errMsg, 30))
 			}
-			t.AppendRow(table.Row{icon, shortPod, st.container, st.lineCount(), timeRange})
+			t.AppendRow(table.Row{
+				icon,
+				app,
+				text.FgCyan.Sprint(shortPod),
+				text.FgCyan.Sprint(st.container),
+				st.lineCount(),
+				timeRange,
+			})
 		}
-		t.Render()
+
+		// Separator between app groups (skip after the last one).
+		if i < len(appOrder)-1 {
+			t.AppendSeparator()
+		}
 	}
 
-	// Grand total table.
-	fmt.Println()
-	tot := table.NewWriter()
-	tot.SetOutputMirror(os.Stdout)
-	tot.SetStyle(summaryTableStyle)
-	tot.SetColumnConfigs([]table.ColumnConfig{
-		{Number: 1, Align: text.AlignLeft, Colors: text.Colors{text.Bold}},
-		{Number: 2, Align: text.AlignRight, Colors: text.Colors{text.Bold}},
-		{Number: 3, Align: text.AlignRight, Colors: text.Colors{text.Bold}},
-		{Number: 4, Align: text.AlignRight, Colors: text.Colors{text.Bold}},
+	// Grand-total footer.
+	t.AppendFooter(table.Row{
+		"",
+		text.Bold.Sprint("TOTAL"),
+		text.FgHiBlack.Sprintf("%d pod(s)", totalPods),
+		text.FgHiBlack.Sprintf("%d stream(s)", totalContainers),
+		text.Bold.Sprint(totalLines),
+		"",
 	})
-	tot.AppendHeader(table.Row{"TOTAL", "PODS", "STREAMS", "LINES"})
-	tot.AppendRow(table.Row{"all apps", totalPods, totalContainers, totalLines})
-	tot.Render()
+	t.Render()
+	fmt.Println()
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -737,8 +756,18 @@ func main() {
 	streams, wg := launchStreams(allPodContainers, cfg)
 	streamsStore.Store(streams)
 
+	start := time.Now()
 	displayMonitor(streams, cfg.since)
 	wg.Wait()
+	elapsed := time.Since(start).Round(time.Second)
+
+	// All N kubectl processes have exited; no hidden work remains.
+	// If one stream ran much longer than the others it is simply the slowest
+	// pod — the -T flag (default 2m) caps any runaway stream.
+	fmt.Printf("%s  %s\n",
+		text.FgGreen.Sprint("✔ All streams finished"),
+		text.FgHiBlack.Sprintf("total elapsed: %s", elapsed),
+	)
 
 	printSummary(streams)
 	if cfg.since != "" {
