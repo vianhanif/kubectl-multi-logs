@@ -29,25 +29,12 @@ const (
 	ansiDim    = "\033[2m"
 	ansiClearL = "\033[K"
 	ansiRed    = "\033[31m"
+	ansiCyan   = "\033[36m" // pod names
 
 	defaultOutput = "tail_multiple_logs_data.log"
 )
 
 var braille = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-
-// appColorPalette provides distinct colors cycled per-app in the display.
-var appColorPalette = []string{
-	"\033[34m", // blue
-	"\033[35m", // magenta
-	"\033[33m", // yellow
-	"\033[96m", // bright cyan
-	"\033[95m", // bright magenta
-	"\033[94m", // bright blue
-	"\033[93m", // bright yellow
-	"\033[92m", // bright green
-	"\033[91m", // bright red
-	"\033[31m", // red
-}
 
 func termWidth() int {
 	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
@@ -215,9 +202,11 @@ func getContainersForPod(pod, namespace string) ([]string, error) {
 // streamState tracks live stats for one pod/container log stream.
 type streamState struct {
 	app, pod, container string
-	count               int64  // updated atomically
-	done                int32  // 1 when kubectl exits, set atomically
-	errMsg              string // written once before markDone; safe to read after isDone
+	count               int64     // updated atomically
+	done                int32     // 1 when kubectl exits, set atomically
+	errMsg              string    // written once before markDone; safe to read after isDone
+	startedAt           time.Time // wall time when first log line received; zero if no lines
+	lastAt              time.Time // wall time when last log line received
 }
 
 func (s *streamState) addLines(n int64)    { atomic.AddInt64(&s.count, n) }
@@ -259,11 +248,18 @@ func streamLogs(st *streamState, cfg streamConfig) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var batch int64
+	firstLine := true
 	for scanner.Scan() {
 		text := scanner.Text()
 		if cfg.grepPattern != "" && !matchesPattern(text, cfg.grepPattern) {
 			continue
 		}
+		now := time.Now()
+		if firstLine {
+			st.startedAt = now
+			firstLine = false
+		}
+		st.lastAt = now
 		line := prefix + text + "\n"
 		cfg.mu.Lock()
 		cfg.outFile.WriteString(line) //nolint:errcheck
@@ -314,16 +310,6 @@ func displayMonitor(streams []*streamState, since string) {
 		return sorted[i].pod < sorted[j].pod
 	})
 
-	// Assign a consistent color to each app (in sorted order)
-	appColorMap := map[string]string{}
-	colorIdx := 0
-	for _, st := range sorted {
-		if _, ok := appColorMap[st.app]; !ok {
-			appColorMap[st.app] = appColorPalette[colorIdx%len(appColorPalette)]
-			colorIdx++
-		}
-	}
-
 	total := len(sorted)
 	printedApp := map[string]bool{}
 	printedStream := make([]bool, total)
@@ -342,17 +328,16 @@ func displayMonitor(streams []*streamState, since string) {
 			if printedStream[i] || !st.isDone() {
 				continue
 			}
-			appColor := appColorMap[st.app]
-			// Print app header once, in the app's color
+			// Print app header once (bold)
 			if !printedApp[st.app] {
-				printPermanent(fmt.Sprintf("  %s%s%s%s", appColor, ansiBold, st.app, ansiReset))
+				printPermanent(fmt.Sprintf("  %s%s%s", ansiBold, st.app, ansiReset))
 				printedApp[st.app] = true
 			}
 			if st.isFailed() {
 				printPermanent(fmt.Sprintf(
 					"    %s✗%s [%s%s%s] %s  %s%s%s",
 					ansiRed, ansiReset,
-					appColor, st.pod, ansiReset,
+					ansiCyan, st.pod, ansiReset,
 					st.container,
 					ansiDim, truncate(st.errMsg, 60), ansiReset,
 				))
@@ -370,7 +355,7 @@ func displayMonitor(streams []*streamState, since string) {
 				printPermanent(fmt.Sprintf(
 					"    %s✔%s [%s%s%s] %s%s%s%s%s",
 					ansiGreen, ansiReset,
-					appColor, st.pod, ansiReset,
+					ansiCyan, st.pod, ansiReset,
 					st.container,
 					strings.Repeat(" ", pad),
 					ansiDim, rightVis, ansiReset,
@@ -397,58 +382,95 @@ func displayMonitor(streams []*streamState, since string) {
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
-// printSummary prints a per-app table of pods, streams, and lines collected.
+// printSummary prints a per-app breakdown with per-container detail,
+// including line counts and first/last log timestamps.
 func printSummary(streams []*streamState) {
 	if len(streams) == 0 {
 		return
 	}
 
-	type appStat struct {
+	type appGroup struct {
 		pods       map[string]bool
-		containers int
+		containers []*streamState
 		lines      int64
 		errors     int
 	}
-	stats := map[string]*appStat{}
-	var appOrder []string
 
+	groups := map[string]*appGroup{}
+	var appOrder []string
 	for _, st := range streams {
-		if _, ok := stats[st.app]; !ok {
-			stats[st.app] = &appStat{pods: map[string]bool{}}
+		if _, ok := groups[st.app]; !ok {
+			groups[st.app] = &appGroup{pods: map[string]bool{}}
 			appOrder = append(appOrder, st.app)
 		}
-		s := stats[st.app]
-		s.pods[st.pod] = true
-		s.containers++
-		s.lines += st.lineCount()
+		g := groups[st.app]
+		g.pods[st.pod] = true
+		g.containers = append(g.containers, st)
+		g.lines += st.lineCount()
 		if st.isFailed() {
-			s.errors++
+			g.errors++
 		}
 	}
 	sort.Strings(appOrder)
 
-	totalPods, totalContainers, totalLines := 0, 0, int64(0)
-	for _, s := range stats {
-		totalPods += len(s.pods)
-		totalContainers += s.containers
-		totalLines += s.lines
+	for _, g := range groups {
+		sort.Slice(g.containers, func(i, j int) bool {
+			if g.containers[i].pod != g.containers[j].pod {
+				return g.containers[i].pod < g.containers[j].pod
+			}
+			return g.containers[i].container < g.containers[j].container
+		})
 	}
 
-	sep := "  " + strings.Repeat("─", 66)
-	fmt.Printf("\n%s── Summary ──────────────────────────────────────────────────────%s\n", ansiBold, ansiReset)
-	fmt.Printf("  %-38s  %4s  %8s  %10s\n", "App", "Pods", "Streams", "Lines")
-	fmt.Println(sep)
-	for _, app := range appOrder {
-		s := stats[app]
-		errMark := ""
-		if s.errors > 0 {
-			errMark = fmt.Sprintf("  %s(%d err)%s", ansiRed, s.errors, ansiReset)
-		}
-		fmt.Printf("  %-38s  %4d  %8d  %10d%s\n",
-			app, len(s.pods), s.containers, s.lines, errMark)
+	totalPods, totalContainers, totalLines := 0, 0, int64(0)
+	for _, g := range groups {
+		totalPods += len(g.pods)
+		totalContainers += len(g.containers)
+		totalLines += g.lines
 	}
+
+	const tsLayout = "15:04:05"
+	sep := "  " + strings.Repeat("─", 72)
+
+	fmt.Printf("\n%s── Summary%s\n", ansiBold, ansiReset)
+	for _, app := range appOrder {
+		g := groups[app]
+		errPart := ""
+		if g.errors > 0 {
+			errPart = fmt.Sprintf("  %s(%d err)%s", ansiRed, g.errors, ansiReset)
+		}
+		fmt.Printf("\n  %s%s%s  %s%d pod(s) · %d stream(s) · %d lines%s%s\n",
+			ansiBold, app, ansiReset,
+			ansiDim, len(g.pods), len(g.containers), g.lines, errPart, ansiReset)
+
+		for _, st := range g.containers {
+			if st.isFailed() {
+				fmt.Printf("    %s✗%s [%s%s%s] %-22s  %s%s%s\n",
+					ansiRed, ansiReset,
+					ansiCyan, st.pod, ansiReset,
+					st.container,
+					ansiDim, truncate(st.errMsg, 50), ansiReset)
+			} else {
+				ts := ""
+				if !st.startedAt.IsZero() {
+					ts = fmt.Sprintf("  %s%s → %s%s",
+						ansiDim,
+						st.startedAt.Format(tsLayout),
+						st.lastAt.Format(tsLayout),
+						ansiReset)
+				}
+				fmt.Printf("    %s✔%s [%s%s%s] %-22s  %8d lines%s\n",
+					ansiGreen, ansiReset,
+					ansiCyan, st.pod, ansiReset,
+					st.container,
+					st.lineCount(),
+					ts)
+			}
+		}
+	}
+	fmt.Println()
 	fmt.Println(sep)
-	fmt.Printf("  %-38s  %4d  %8d  %10d\n", "TOTAL", totalPods, totalContainers, totalLines)
+	fmt.Printf("  TOTAL   %d pod(s)   %d stream(s)   %d lines\n", totalPods, totalContainers, totalLines)
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
