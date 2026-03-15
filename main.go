@@ -16,23 +16,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 	"golang.org/x/term"
 )
 
-// ─── ANSI helpers ────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const (
-	ansiReset  = "\033[0m"
-	ansiGreen  = "\033[32m"
-	ansiYellow = "\033[33m"
-	ansiBold   = "\033[1m"
-	ansiDim    = "\033[2m"
-	ansiClearL = "\033[K"
-	ansiRed    = "\033[31m"
-	ansiCyan   = "\033[36m" // pod names
-
-	defaultOutput = "tail_multiple_logs_data.log"
-)
+const defaultOutput = "tail_multiple_logs_data.log"
 
 var braille = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -47,23 +38,15 @@ func termWidth() int {
 	return 80
 }
 
-// printPermanent erases the spinner line and prints a permanent ✔ line.
-func printPermanent(line string) {
-	fmt.Printf("\r%s%s\n", ansiClearL, line)
-}
+// clearLine erases the current terminal line and moves cursor to column 0.
+func clearLine() { fmt.Print("\r\033[K") }
 
-// printSpinner overwrites the current line with a spinner status (no newline).
+// printPermanent erases the spinner line and prints a permanent line.
+func printPermanent(line string) { clearLine(); fmt.Println(line) }
+
+// printSpinner overwrites the current line with a spinner (no newline).
 func printSpinner(spin, msg string) {
-	fmt.Printf("\r%s  %s%s%s  %s%s", ansiClearL, ansiYellow, spin, ansiReset, msg, ansiClearL)
-}
-
-// rightPad returns a string padded between left and right to fill `width` columns.
-func rightPad(left, right string, width int) string {
-	pad := width - len(left) - len(right)
-	if pad < 1 {
-		pad = 1
-	}
-	return left + strings.Repeat(" ", pad) + right
+	fmt.Printf("\r\033[K  %s  %s", text.FgYellow.Sprint(spin), msg)
 }
 
 // truncate shortens s to at most n bytes, appending "..." if cut.
@@ -107,14 +90,14 @@ type phaseItem struct {
 // printPhaseItem prints a single completed phase item permanently.
 func printPhaseItem(item phaseItem) {
 	cols := termWidth()
+	checkmark := text.FgGreen.Sprint("✔")
 	leftVis := fmt.Sprintf("  ✔  %s", item.label)
-	dimResult := fmt.Sprintf("%s%s%s", ansiDim, item.result, ansiReset)
+	rightVis := text.FgHiBlack.Sprint(item.result)
 	pad := cols - len(leftVis) - len(item.result)
 	if pad < 1 {
 		pad = 1
 	}
-	printPermanent(fmt.Sprintf("  %s✔%s  %s%s%s",
-		ansiGreen, ansiReset, item.label, strings.Repeat(" ", pad), dimResult))
+	printPermanent(fmt.Sprintf("  %s  %s%s%s", checkmark, item.label, strings.Repeat(" ", pad), rightVis))
 }
 
 // phaseMonitor prints items permanently as they arrive on doneCh, with a
@@ -150,7 +133,7 @@ func phaseMonitor(total int, doneCh <-chan phaseItem) {
 			printSpinner(spin, fmt.Sprintf("Waiting for %d more...", total-printed))
 		}
 	}
-	fmt.Printf("\r%s", ansiClearL) // clear spinner line
+	clearLine() // clear spinner line
 }
 
 // ─── Kubernetes helpers ───────────────────────────────────────────────────────
@@ -345,35 +328,34 @@ func displayMonitor(streams []*streamState, since string) {
 			}
 			// Print app header once (bold)
 			if !printedApp[st.app] {
-				printPermanent(fmt.Sprintf("  %s%s%s", ansiBold, st.app, ansiReset))
+				printPermanent("  " + text.Bold.Sprint(st.app))
 				printedApp[st.app] = true
 			}
 			if st.isFailed() {
-				printPermanent(fmt.Sprintf(
-					"    %s✗%s [%s%s%s] %s  %s%s%s",
-					ansiRed, ansiReset,
-					ansiCyan, st.pod, ansiReset,
+				printPermanent(fmt.Sprintf("    %s [%s] %s  %s",
+					text.FgRed.Sprint("✗"),
+					text.FgCyan.Sprint(st.pod),
 					st.container,
-					ansiDim, truncate(st.errMsg, 60), ansiReset,
+					text.FgHiBlack.Sprint(truncate(st.errMsg, 60)),
 				))
 			} else {
 				cols := termWidth()
 				leftVis := fmt.Sprintf("    ✔ [%s] %s", st.pod, st.container)
-				rightVis := fmt.Sprintf("Collected   %d lines", st.lineCount())
+				rightLabel := "Collected"
 				if since == "" {
-					rightVis = fmt.Sprintf("Following   %d lines", st.lineCount())
+					rightLabel = "Following"
 				}
+				rightVis := fmt.Sprintf("%s   %d lines", rightLabel, st.lineCount())
 				pad := cols - len(leftVis) - len(rightVis)
 				if pad < 1 {
 					pad = 1
 				}
-				printPermanent(fmt.Sprintf(
-					"    %s✔%s [%s%s%s] %s%s%s%s%s",
-					ansiGreen, ansiReset,
-					ansiCyan, st.pod, ansiReset,
+				printPermanent(fmt.Sprintf("    %s [%s] %s%s%s",
+					text.FgGreen.Sprint("✔"),
+					text.FgCyan.Sprint(st.pod),
 					st.container,
 					strings.Repeat(" ", pad),
-					ansiDim, rightVis, ansiReset,
+					text.FgHiBlack.Sprint(rightVis),
 				))
 			}
 			printedStream[i] = true
@@ -410,14 +392,14 @@ func displayMonitor(streams []*streamState, since string) {
 				}
 				shown := 0
 				for _, st := range pending[:limit] {
-					fmt.Printf("\n    [%s%s%s] %s  %s%s%s",
-						ansiCyan, truncate(st.pod, 45), ansiReset,
+					fmt.Printf("\n    [%s] %s  %s",
+						text.FgCyan.Sprint(truncate(st.pod, 45)),
 						st.container,
-						ansiDim, st.statusLabel(), ansiReset)
+						text.FgHiBlack.Sprint(st.statusLabel()))
 					shown++
 				}
 				if len(pending) > maxPendingShown {
-					fmt.Printf("\n    %s… and %d more pending%s", ansiDim, len(pending)-maxPendingShown, ansiReset)
+					fmt.Printf("\n    %s", text.FgHiBlack.Sprintf("… and %d more pending", len(pending)-maxPendingShown))
 					shown++
 				}
 				prevLines = shown
@@ -427,7 +409,7 @@ func displayMonitor(streams []*streamState, since string) {
 			}
 		}
 	}
-	fmt.Printf("\r%s", ansiClearL)
+	clearLine()
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
@@ -449,12 +431,36 @@ func longestCommonPrefix(ss []string) string {
 	return prefix
 }
 
+// summaryTableStyle is the go-pretty table style used for the summary.
+var summaryTableStyle = table.Style{
+	Name: "Summary",
+	Box:  table.StyleBoxRounded,
+	Color: table.ColorOptions{
+		Header:    text.Colors{text.Bold},
+		Footer:    text.Colors{text.Bold},
+		Border:    text.Colors{text.FgHiBlack},
+		Separator: text.Colors{text.FgHiBlack},
+	},
+	Format: table.FormatOptions{
+		Header: text.FormatUpper,
+		Footer: text.FormatDefault,
+	},
+	Options: table.Options{
+		DrawBorder:      true,
+		SeparateColumns: true,
+		SeparateHeader:  true,
+		SeparateRows:    false,
+	},
+}
+
 // printSummary prints a per-app breakdown with per-container detail,
-// including line counts and first/last log timestamps, in aligned columns.
+// including line counts and first/last log timestamps, using go-pretty/table.
 func printSummary(streams []*streamState) {
 	if len(streams) == 0 {
 		return
 	}
+
+	const tsLayout = "15:04:05"
 
 	type appGroup struct {
 		pods       map[string]bool
@@ -496,86 +502,83 @@ func printSummary(streams []*streamState) {
 		totalLines += g.lines
 	}
 
-	const tsLayout = "15:04:05"
-	const colLines = 7  // width for right-aligned line count
-	const colTime = 19  // "HH:MM:SS → HH:MM:SS"
-	const indent = "    "
+	fmt.Println()
+	fmt.Println(text.Bold.Sprint("── Summary"))
 
-	fmt.Printf("\n%s── Summary%s\n", ansiBold, ansiReset)
 	for _, app := range appOrder {
 		g := groups[app]
-		errPart := ""
-		if g.errors > 0 {
-			errPart = fmt.Sprintf("  %s(%d err)%s", ansiRed, g.errors, ansiReset)
-		}
-		fmt.Printf("\n  %s%s%s  %s%d pod(s) · %d stream(s) · %d lines%s%s\n",
-			ansiBold, app, ansiReset,
-			ansiDim, len(g.pods), len(g.containers), g.lines, errPart, ansiReset)
 
-		// Compute shortest unique pod label by stripping the common prefix.
+		// Strip the common pod-name prefix to keep POD column narrow.
 		allPodNames := make([]string, len(g.containers))
 		for i, st := range g.containers {
 			allPodNames[i] = st.pod
 		}
 		podPrefix := longestCommonPrefix(allPodNames)
-		// Only strip if it saves meaningful space; keep at least 1 char.
 		if len(podPrefix) > 0 && len(podPrefix) >= len(allPodNames[0])-1 {
-			podPrefix = "" // all pods identical — would strip everything
+			podPrefix = ""
 		}
 
-		// Compute column widths from actual data.
-		maxPod, maxContainer := len("POD"), len("CONTAINER")
-		for i, st := range g.containers {
-			shortPod := strings.TrimPrefix(allPodNames[i], podPrefix)
-			if len(shortPod) > maxPod {
-				maxPod = len(shortPod)
-			}
-			if len(st.container) > maxContainer {
-				maxContainer = len(st.container)
-			}
+		// App section header.
+		errSuffix := ""
+		if g.errors > 0 {
+			errSuffix = "  " + text.FgRed.Sprintf("(%d err)", g.errors)
 		}
-
-		// Show the stripped prefix so users can reconstruct the full name.
+		fmt.Printf("\n  %s  %s%s\n",
+			text.Bold.Sprint(app),
+			text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s) · %d lines", len(g.pods), len(g.containers), g.lines),
+			errSuffix,
+		)
 		if podPrefix != "" {
-			fmt.Printf("%s%spod prefix: %s%s\n", indent, ansiDim, podPrefix, ansiReset)
+			fmt.Printf("  %s\n", text.FgHiBlack.Sprintf("pod prefix: %s", podPrefix))
 		}
 
-		// Column header.
-		totalRowWidth := maxPod + 2 + maxContainer + 2 + colLines + 2 + colTime
-		fmt.Printf("%s%s%-*s  %-*s  %*s  %-*s%s\n",
-			indent, ansiDim,
-			maxPod, "POD",
-			maxContainer, "CONTAINER",
-			colLines, "LINES",
-			colTime, "TIME RANGE",
-			ansiReset)
-		fmt.Printf("%s%s%s%s\n", indent, ansiDim, strings.Repeat("─", totalRowWidth), ansiReset)
+		// Per-app table.
+		t := table.NewWriter()
+		t.SetOutputMirror(os.Stdout)
+		t.SetStyle(summaryTableStyle)
+		t.SetColumnConfigs([]table.ColumnConfig{
+			{Number: 1, Align: text.AlignLeft},                                        // icon
+			{Number: 2, Align: text.AlignLeft, Colors: text.Colors{text.FgCyan}},      // pod
+			{Number: 3, Align: text.AlignLeft, Colors: text.Colors{text.FgCyan}},      // container
+			{Number: 4, Align: text.AlignRight, Colors: text.Colors{text.FgHiWhite}},  // lines
+			{Number: 5, Align: text.AlignCenter, Colors: text.Colors{text.FgHiBlack}}, // time range
+		})
+		t.AppendHeader(table.Row{" ", "POD", "CONTAINER", "LINES", "TIME RANGE"})
 
-		// Data rows.
 		for i, st := range g.containers {
 			shortPod := strings.TrimPrefix(allPodNames[i], podPrefix)
-			statusColor, statusIcon := ansiGreen, "✔"
+			var icon string
 			if st.isFailed() {
-				statusColor, statusIcon = ansiRed, "✗"
+				icon = text.FgRed.Sprint("✗")
+			} else {
+				icon = text.FgGreen.Sprint("✔")
 			}
 			timeRange := ""
 			if !st.startedAt.IsZero() {
-				timeRange = fmt.Sprintf("%s → %s", st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
+				timeRange = fmt.Sprintf("%s → %s",
+					st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
 			} else if st.isFailed() {
-				timeRange = truncate(st.errMsg, colTime)
+				timeRange = truncate(st.errMsg, 30)
 			}
-			fmt.Printf("%s%s%s%s %-*s  %s%-*s%s  %*d  %s%-*s%s\n",
-				indent,
-				statusColor, statusIcon, ansiReset,
-				maxPod, shortPod,
-				ansiCyan, maxContainer, st.container, ansiReset,
-				colLines, st.lineCount(),
-				ansiDim, colTime, timeRange, ansiReset)
+			t.AppendRow(table.Row{icon, shortPod, st.container, st.lineCount(), timeRange})
 		}
+		t.Render()
 	}
-	sep := "\n  " + strings.Repeat("─", 72)
-	fmt.Println(sep)
-	fmt.Printf("  TOTAL   %d pod(s)   %d stream(s)   %d lines\n", totalPods, totalContainers, totalLines)
+
+	// Grand total table.
+	fmt.Println()
+	tot := table.NewWriter()
+	tot.SetOutputMirror(os.Stdout)
+	tot.SetStyle(summaryTableStyle)
+	tot.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 1, Align: text.AlignLeft, Colors: text.Colors{text.Bold}},
+		{Number: 2, Align: text.AlignRight, Colors: text.Colors{text.Bold}},
+		{Number: 3, Align: text.AlignRight, Colors: text.Colors{text.Bold}},
+		{Number: 4, Align: text.AlignRight, Colors: text.Colors{text.Bold}},
+	})
+	tot.AppendHeader(table.Row{"TOTAL", "PODS", "STREAMS", "LINES"})
+	tot.AppendRow(table.Row{"all apps", totalPods, totalContainers, totalLines})
+	tot.Render()
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -668,8 +671,8 @@ func main() {
 		if n := int(pendingLinesDrawn.Load()); n > 0 {
 			fmt.Printf("\033[%dA\r\033[J", n)
 		}
-		fmt.Printf("\r%s\n%sCtrl+C received — stopping all log streams...%s\n",
-			ansiClearL, ansiYellow, ansiReset)
+		clearLine()
+		fmt.Printf("\n%s\n", text.FgYellow.Sprint("Ctrl+C received — stopping all log streams..."))
 		outFile.Close()
 		if v := streamsStore.Load(); v != nil {
 			printSummary(v.([]*streamState))
@@ -776,7 +779,7 @@ func launchStreams(allPodContainers []podContainers, cfg streamConfig) ([]*strea
 		for {
 			select {
 			case <-prepDone:
-				fmt.Printf("\r%s", ansiClearL)
+				clearLine()
 				return
 			case <-time.After(100 * time.Millisecond):
 				printSpinner(braille[i%len(braille)], "Preparing streams...")
