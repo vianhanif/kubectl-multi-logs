@@ -11,9 +11,8 @@ A Bash script to efficiently collect and tail logs from multiple Kubernetes pods
 - **Real-Time & Historical Modes**: Tail logs live or retrieve historical logs from a specified time.
 - **Flexible Filtering**: Filter by patterns or focus on error logs (ERROR, WARN, etc.).
 - **Organized Output**: Prefixes logs with `[pod:container]` for easy identification.
-- **Quiet Mode**: Save logs to a file without terminal output.
-- **Progress Indicators**: Visual feedback with spinners and counters.
-- **Tree-Table Summary**: Displays a clear overview of apps and containers being monitored.
+- **Always Saved to File**: Logs are always written to an output file for later analysis.
+- **Brew-style Live Progress**: Scroll-and-advance terminal UI — each pod/container prints a permanent ✔ line (with line count) as it completes, grouped by app, with a live spinner showing remaining streams. No duplication, no cursor-jumping.
 - **Cross-Platform**: Compatible with bash/zsh; works on macOS/Linux.
 
 ## Benefits
@@ -22,7 +21,7 @@ A Bash script to efficiently collect and tail logs from multiple Kubernetes pods
 - **Copilot-Ready Debugging**: Output files can be analyzed by AI tools like GitHub Copilot for correlating issues across pods and replicas.
 - **Comprehensive Coverage**: Ensures no pod or replica is missed during troubleshooting.
 - **Speed & Efficiency**: Parallel processing cuts down collection time for large deployments.
-- **User-Friendly**: Progress spinners, organized prefixes, and summaries enhance the experience.
+- **Zero Duplication**: Scroll-and-advance UI means every status line is printed exactly once.
 - **Flexible Workflows**: Supports background saving, filtering, and integration with shell aliases.
 
 ## Installation
@@ -98,24 +97,41 @@ kubectl get pods -o jsonpath='{.items[*].metadata.labels.app}' | tr ' ' '\n' | s
 
 ### Terminal Output
 
-When running the script, you'll see progress feedback followed by the collected logs:
+The script runs through three phases, each showing a live brew-style progress display:
 
+**Phase 1 — Finding pods** (one permanent line per app as results arrive):
 ```
-$ ./tail_multiple_logs.sh -s 10m agent-service tez-api
+Finding pods for apps...
+  ✔  agent-service                                      15 pod(s)
+  ✔  agent-service-worker                                3 pod(s)
+  ✔  tez-api                                             3 pod(s)
+  ⠸  Waiting for 2 more...
+```
 
- [/] Finding pods... (2/2)
+**Phase 2 — Fetching containers** (one permanent line per pod):
+```
 Fetching containers for pods...
-Showing historical logs from 10m to now for 5 pods and their containers.
-Building summary of apps and containers...
-App: agent-service
-  - agent-service
-  - nginx
-App: tez-api
-  - tez-api
-  - celery-worker
-  - nginx
-Starting logs for pod: tez-api-6f8b9c7d4-xk2mn (5/5)
- [|] Collecting logs...
+  ✔  agent-service-deployment-7b54bf66c7-2f79w           1 container(s)
+  ✔  agent-service-worker-deployment-6b5b6cbdf7-bbkll    2 container(s)
+  ✔  tez-api-deployment-77d5fb6445-hknxx                 1 container(s)
+  ⠼  Waiting for 4 more...
+```
+
+**Phase 3 — Collecting / following logs** (grouped by app, spinner shows overall progress):
+```
+Showing historical logs from 10m to now for 21 pods and their containers.
+Logs are being saved to: /path/to/tail_multiple_logs_data.log
+Press Ctrl+C to stop all log streams
+----------------------------------------
+  agent-service
+    ✔ [agent-service-deployment-7b54bf66c7-2f79w] agent-service      Collected  1557 lines
+    ✔ [agent-service-deployment-7b54bf66c7-425mh] agent-service      Collected  1551 lines
+  agent-service-worker
+    ✔ [agent-service-worker-deployment-6b5b6cbdf7-bbkll] agent-service-worker   Collected    61 lines
+    ✔ [agent-service-worker-deployment-6b5b6cbdf7-bbkll] agent-cron-worker      Collected   153 lines
+  tez-api
+    ✔ [tez-api-deployment-77d5fb6445-hknxx] tez-api                  Collected 14504 lines
+  ⠸  Collecting logs... (5/21 streams done)
 
 Historical logs collection completed. Logs saved to: /path/to/tail_multiple_logs_data.log
 ```

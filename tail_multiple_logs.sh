@@ -34,6 +34,8 @@ shift $((OPTIND-1))
 # Get script directory
 script_dir=$(cd "$(dirname "$0")" && pwd)
 output_file_path="${script_dir}/${output_file}"
+# Temporary directory for per-stream status tracking
+status_dir=$(mktemp -d)
 
 # Determine if quiet mode (no terminal output)
 if [ "$output_specified" = true ]; then
@@ -52,32 +54,48 @@ if [ "$errors" = "true" ]; then
 fi
 
 # Spinner function for loading animation
-spinner() {
-    local spinstr='|/-\'
+# Scroll-and-advance monitor for setup phases.
+# Items are printed permanently (one line each) as they complete;
+# a single spinner line at the bottom is overwritten with \r.
+phase_monitor() {
+    local spins=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local spin_idx=0
+    local -a items=("$@")
+    local n=${#items[@]}
+    local done_count=0
 
-    if [ $# -eq 1 ]; then
-        local message=$1
-        local delay=0.1
-        while true; do
-            local temp=${spinstr#?}
-            printf " [%c] $message " "$spinstr"
-            spinstr=$temp${spinstr%"$temp"}
-            sleep $delay
-            printf "\r"
+    while [ $done_count -lt $n ]; do
+        local pending=0 cols spin_char
+        cols=$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)
+        spin_char="${spins[$spin_idx]}"
+
+        for item in "${items[@]}"; do
+            local safe
+            safe=$(printf '%s' "$item" | tr ':/' '__')
+            [ -f "${status_dir}/${safe}.printed" ] && continue
+
+            if [ -f "${status_dir}/${safe}.done" ]; then
+                local result
+                result=$(cat "${status_dir}/${safe}.result" 2>/dev/null || echo "done")
+                local left_vis="  x  ${item}"
+                local pad=$(( cols - ${#left_vis} - ${#result} - 2 ))
+                [ $pad -lt 1 ] && pad=1
+                printf "\r\033[K  \033[32m✔\033[0m  %s%${pad}s\033[2m%s\033[0m\n" \
+                    "$item" "" "$result"
+                touch "${status_dir}/${safe}.printed"
+                ((done_count++))
+            else
+                ((pending++))
+            fi
         done
-    elif [ $# -eq 2 ]; then
-        local total=$1
-        local file=$2
-        local delay=0.1
-        while true; do
-            local temp=${spinstr#?}
-            local current=$(wc -l < "$file" 2>/dev/null || echo 0)
-            printf " [%c] Finding pods... ($current/$total) " "$spinstr"
-            spinstr=$temp${spinstr%"$temp"}
-            sleep $delay
-            printf "\r"
-        done
-    fi
+
+        if [ $done_count -lt $n ]; then
+            printf "  \033[33m%s\033[0m  Waiting for %d more...\033[K\r" "$spin_char" "$pending"
+            sleep 0.1
+            spin_idx=$(( (spin_idx + 1) % ${#spins[@]} ))
+        fi
+    done
+    printf "\r\033[K"
 }
 
 # Determine if we should follow logs
@@ -99,133 +117,84 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
-# Collect all pod names in parallel (unchanged)
-echo "Finding pods for apps..." >&2
-counter_file=$(mktemp)
-( spinner $# $counter_file ) 2>/dev/null & spinner_pid=$!
-disown $spinner_pid
+# Phase 1: Find all pods for given apps in parallel
+echo "Finding pods for apps..."
 pods=()
 temp_file=$(mktemp)
 pids=()
 
 for app in "$@"; do
+    safe=$(printf '%s' "$app" | tr ':/' '__')
     (
         app_pods=$(kubectl get pods -l app="$app" ${namespace:+-n "$namespace"} --no-headers -o custom-columns=":metadata.name" 2>/dev/null)
         if [ -z "$app_pods" ]; then
-            echo "Warning: No pods found for app '$app'" >&2
+            printf "no pods found" > "${status_dir}/${safe}.result"
         else
+            cnt=0
             for pod in $app_pods; do
                 echo "$app|$pod" >> "$temp_file"
+                ((cnt++))
             done
+            printf "%d pod(s)" "$cnt" > "${status_dir}/${safe}.result"
         fi
-        echo 1 >> "$counter_file"
+        printf "done\n" > "${status_dir}/${safe}.done"
     ) &
     pids+=($!)
 done
 
-# Wait for all background jobs
-for pid in "${pids[@]}"; do
-    wait "$pid"
-done
+phase_monitor "$@"
+for pid in "${pids[@]}"; do wait "$pid"; done
 
-# Read pods from temp file
 while IFS='|' read -r app pod; do
     pods+=("$pod")
 done < "$temp_file"
-rm "$counter_file"
-
-# Stop spinner
-if [ -n "$spinner_pid" ]; then
-    kill $spinner_pid 2>/dev/null
-    printf '\r'
-    tput el 2>/dev/null || printf '%60s\r' ''
-fi
 
 if [ ${#pods[@]} -eq 0 ]; then
     echo "No pods found for the specified apps. Exiting."
     exit 1
 fi
 
-echo "Fetching containers for pods..." >&2
-
-# NEW: Parallelize fetching containers for all pods
+# Phase 2: Fetch containers for all pods in parallel
+echo "Fetching containers for pods..."
 temp_containers_file=$(mktemp)
-concurrency_limit=10  # Limit parallel kubectl calls to avoid overwhelming the cluster
 pids=()
-active_jobs=0
 
 for pod in "${pods[@]}"; do
+    safe=$(printf '%s' "$pod" | tr ':/' '__')
     (
         containers=$(kubectl get pod "$pod" ${namespace:+-n "$namespace"} -o jsonpath='{.spec.containers[*].name}' 2>/dev/null)
         if [ -z "$containers" ]; then
-            echo "Warning: No containers found for pod $pod" >&2
+            printf "no containers" > "${status_dir}/${safe}.result"
         else
+            cnt=$(echo "$containers" | wc -w | tr -d ' ')
+            printf "%s container(s)" "$cnt" > "${status_dir}/${safe}.result"
             echo "$pod|$containers" >> "$temp_containers_file"
         fi
+        printf "done\n" > "${status_dir}/${safe}.done"
     ) &
     pids+=($!)
-    ((active_jobs++))
-    
-    # Throttle concurrency
-    if [ "$active_jobs" -ge "$concurrency_limit" ]; then
-        wait "${pids[0]}"  # Wait for the first job to finish
-        pids=("${pids[@]:1}")  # Remove it from the array
-        ((active_jobs--))
-    fi
 done
 
-# Wait for remaining jobs
-for pid in "${pids[@]}"; do
-    wait "$pid"
-done
-
-if [ ${#pods[@]} -eq 0 ]; then
-    echo "No pods found for the specified apps. Exiting."
-    exit 1
-fi
+phase_monitor "${pods[@]}"
+for pid in "${pids[@]}"; do wait "$pid"; done
 
 # Truncate the output file
 : > "$output_file_path"
 
 if [ -n "$since" ]; then
     echo "Showing historical logs from $since to now for ${#pods[@]} pods and their containers."
-    
-    echo "Building summary of apps and containers..."
-    # Display tree-table of apps and containers
-    app_containers_file=$(mktemp)
-    while IFS='|' read -r app pod; do
-        containers=$(grep "^$pod|" "$temp_containers_file" | cut -d'|' -f2)
-        echo "$app|$containers" >> "$app_containers_file"
-    done < "$temp_file"
-    
-    sort -u "$app_containers_file" | while IFS='|' read -r app conts; do
-        echo "App: $app"
-        for c in $conts; do
-            echo "  - $c"
-        done
-    done
-    rm "$app_containers_file"
 else
     echo "Starting log tailing for ${#pods[@]} pods and their containers."
 fi
-rm "$temp_file"
-if [ "$quiet_mode" = true ]; then
-    echo "Logs are being saved to: $output_file_path"
-fi
+echo "Logs are being saved to: $output_file_path"
 echo "Press Ctrl+C to stop all log streams"
 echo "----------------------------------------"
 
 # Function to handle cleanup on exit
 cleanup() {
-    echo ""
+    printf '\n'
     echo "Stopping all log streams..."
-    if [ -n "$spinner_pid" ]; then
-        kill $spinner_pid 2>/dev/null
-    fi
-    # Kill any remaining background processes
-    for pid in "${pids[@]}"; do
-        kill $pid 2>/dev/null
-    done
+    rm -rf "$status_dir" 2>/dev/null
     kill 0
     exit 0
 }
@@ -233,80 +202,134 @@ cleanup() {
 # Set trap to cleanup background processes
 trap cleanup SIGINT SIGTERM
 
-# Define colors using tput for better terminal compatibility
-colors=()
-if command -v tput >/dev/null 2>&1 && [ -n "$TERM" ] && [ "$TERM" != "dumb" ]; then
-    colors=(
-        "$(tput setaf 1)"  # red
-        "$(tput setaf 2)"  # green
-        "$(tput setaf 3)"  # yellow
-        "$(tput setaf 4)"  # blue
-        "$(tput setaf 5)"  # magenta
-        "$(tput setaf 6)"  # cyan
+# Function: stream a pod/container's logs to file, tracking line count for the status display
+stream_log_with_status() {
+    local pod="$1"
+    local container="$2"
+    local label="${pod}:${container}"
+    local safe
+    safe=$(echo "$label" | tr ':/' '__')
+    local count_file="${status_dir}/${safe}.count"
+    local done_file="${status_dir}/${safe}.done"
+    printf "0\n" > "$count_file"
+    local n=0
+    while IFS= read -r line; do
+        printf "[%s] %s\n" "$label" "$line" >> "$output_file_path"
+        n=$((n + 1))
+        printf "%d\n" "$n" > "$count_file"
+    done < <(
+        if [ -n "$grep_pattern" ]; then
+            kubectl logs $follow ${since:+--since="$since"} "$pod" -c "$container" ${namespace:+-n "$namespace"} 2>/dev/null | grep -i "$grep_pattern"
+        else
+            kubectl logs $follow ${since:+--since="$since"} "$pod" -c "$container" ${namespace:+-n "$namespace"} 2>/dev/null
+        fi
     )
-    reset="$(tput sgr0)"
-else
-    # Fallback to ANSI codes if tput not available
-    colors=(
-        "\033[31m"
-        "\033[32m"
-        "\033[33m"
-        "\033[34m"
-        "\033[35m"
-        "\033[36m"
-    )
-    reset="\033[0m"
-fi
-color_index=0
+    printf "done\n" > "$done_file"
+}
 
-# UPDATED: Start tailing logs for each pod and its containers (now all at once after containers are fetched)
-total_pods=${#pods[@]}
-current_pod=0
-for pod in "${pods[@]}"; do
+# Function: scroll-and-advance log status display.
+# Items are printed permanently as they complete, grouped by app.
+# A single spinner line at the bottom is overwritten with \r until all streams finish.
+display_status_monitor() {
+    local spins=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local spin_idx=0
+
+    # Sort items by app then pod so same-app streams complete adjacently
+    local -a sorted_items=()
+    while IFS= read -r _si; do
+        sorted_items+=("$_si")
+    done < <(printf '%s\n' "$@" | sort -t'|' -k1,1 -k2,2)
+
+    local n=${#sorted_items[@]}
+    local done_count=0
+
+    while [ $done_count -lt $n ]; do
+        local cols spin_char _item
+        cols=$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)
+        spin_char="${spins[$spin_idx]}"
+
+        for _item in "${sorted_items[@]}"; do
+            IFS='|' read -r _app _pod _container <<< "$_item"
+            local _safe
+            _safe=$(printf '%s' "${_pod}:${_container}" | tr ':/' '__')
+            [ -f "${status_dir}/${_safe}.printed" ] && continue
+
+            if [ -f "${status_dir}/${_safe}.done" ]; then
+                local _count
+                _count=$(cat "${status_dir}/${_safe}.count" 2>/dev/null || echo 0)
+
+                # Print app header the first time we see a completion for this app
+                local _app_safe
+                _app_safe=$(printf '%s' "$_app" | tr ' /' '__')
+                if [ ! -f "${status_dir}/appheader_${_app_safe}.printed" ]; then
+                    printf "\r\033[K  \033[1m%s\033[0m\n" "$_app"
+                    touch "${status_dir}/appheader_${_app_safe}.printed"
+                fi
+
+                local _left_vis="    x [${_pod}] ${_container}"
+                local _status_word
+                [ -n "$since" ] && _status_word="Collected " || _status_word="Following  "
+                local _right="${_status_word}  ${_count} lines"
+                local _pad=$(( cols - ${#_left_vis} - ${#_right} ))
+                [ $_pad -lt 1 ] && _pad=1
+
+                printf "\r\033[K    \033[32m✔\033[0m [\033[36m%s\033[0m] %s%${_pad}s\033[2m%s\033[0m\n" \
+                    "$_pod" "$_container" "" "$_right"
+                touch "${status_dir}/${_safe}.printed"
+                ((done_count++))
+            fi
+        done
+
+        if [ $done_count -lt $n ]; then
+            local _pending=$(( n - done_count ))
+            [ -n "$since" ] && _verb="Collecting" || _verb="Following "
+            printf "  \033[33m%s\033[0m  %s logs... (%d/%d streams done)\033[K\r" \
+                "$spin_char" "$_verb" "$done_count" "$n"
+            sleep 0.1
+            spin_idx=$(( (spin_idx + 1) % ${#spins[@]} ))
+        fi
+    done
+    printf "\r\033[K"
+}
+
+# Show a spinner while stream processes are being prepared
+( spins=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  i=0
+  while true; do
+    printf "  \033[33m%s\033[0m  Preparing streams...\033[K\r" "${spins[$i]}"
+    sleep 0.1
+    i=$(( (i + 1) % 10 ))
+  done ) & _prep_pid=$!
+
+# Start a background log-stream process for every pod/container, preserving app association
+stream_labels=()
+while IFS='|' read -r app pod; do
     containers=$(grep "^$pod|" "$temp_containers_file" | cut -d'|' -f2)
     if [ -z "$containers" ]; then
-        continue  # Skip if no containers (warning already printed)
+        continue
     fi
-    ((current_pod++))
-    printf "Starting logs for pod: $pod ($current_pod/$total_pods)                                                                                                    \r"
     for container in $containers; do
-        color=${colors[$color_index % ${#colors[@]}]}
-        if [ -n "$grep_pattern" ]; then
-            if [ "$quiet_mode" = true ]; then
-                kubectl logs $follow ${since:+--since="$since"} "$pod" -c "$container" ${namespace:+-n "$namespace"} | grep -i "$grep_pattern" | sed "s/^/[$pod:$container] /" >> "$output_file_path" &
-            else
-                kubectl logs $follow ${since:+--since="$since"} "$pod" -c "$container" ${namespace:+-n "$namespace"} | grep -i "$grep_pattern" | sed "s/^/[$pod:$container] /" | tee -a "$output_file_path" | sed "s/^\[$pod:$container\] /${color}[$pod:$container]${reset} /" &
-            fi
-        else
-            if [ "$quiet_mode" = true ]; then
-                kubectl logs $follow ${since:+--since="$since"} "$pod" -c "$container" ${namespace:+-n "$namespace"} | sed "s/^/[$pod:$container] /" >> "$output_file_path" &
-            else
-                kubectl logs $follow ${since:+--since="$since"} "$pod" -c "$container" ${namespace:+-n "$namespace"} | sed "s/^/[$pod:$container] /" | tee -a "$output_file_path" | sed "s/^\[$pod:$container\] /${color}[$pod:$container]${reset} /" &
-            fi
-        fi
-        ((color_index++))
+        stream_labels+=("${app}|${pod}|${container}")
+        stream_log_with_status "$pod" "$container" &
     done
-done
-printf "\n"
+done < "$temp_file"
+rm "$temp_file"
 
-# Clean up temp file
+# Clean up temp containers file
 rm "$temp_containers_file"
 
-# Start spinner for historical logs collection
-if [ -n "$since" ]; then
-    ( spinner "Collecting logs..." ) 2>/dev/null & spinner_pid=$!
-    disown $spinner_pid
-fi
+# Stop prep spinner and clear its line before monitor takes over
+kill $_prep_pid 2>/dev/null
+printf "\033[K"
 
-# Wait for all background processes
+# Run the brew-like status display in the FOREGROUND (blocks until all streams complete)
+display_status_monitor "${stream_labels[@]}"
+
+# Wait for any remaining background stream processes
 wait
 
-# Stop spinner
-if [ -n "$spinner_pid" ]; then
-    kill $spinner_pid 2>/dev/null
-    printf '\r'
-    tput el 2>/dev/null || printf '%60s\r' ''
-fi
+# Clean up status tracking directory
+rm -rf "$status_dir"
 
 # Show completion summary for historical logs
 if [ -n "$since" ]; then
