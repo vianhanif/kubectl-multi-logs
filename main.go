@@ -798,6 +798,11 @@ func main() {
 	scriptDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
 	outPath := filepath.Join(scriptDir, *outputFile)
 
+	verbCap := "Collecting"
+	if *since == "" {
+		verbCap = "Following"
+	}
+
 	// ── Phase 1 & 2 ─────────────────────────────────────────────────────────
 	var appPods []appPod
 	var allPodContainers []podContainers
@@ -805,11 +810,18 @@ func main() {
 	var cleanT3 *progress.Tracker
 
 	if !*verbose {
-		pw := newPW()
-		verbCap := "Collecting"
-		if *since == "" {
-			verbCap = "Following"
+		// Print one-line header before the bars appear.
+		if *since != "" {
+			fmt.Printf("%s  ·  saving to %s\n",
+				text.Bold.Sprintf("Collecting from last %s", *since),
+				text.FgHiBlack.Sprint(outPath))
+		} else {
+			fmt.Printf("%s  ·  saving to %s\n",
+				text.Bold.Sprint("Following live logs"),
+				text.FgHiBlack.Sprint(outPath))
 		}
+
+		pw := newPW()
 		t1 := &progress.Tracker{Message: cleanLabel("Finding pods..."), Total: int64(len(apps))}
 		t2 := &progress.Tracker{Message: cleanLabel("Fetching containers..."), Total: 0}
 		t3 := &progress.Tracker{Message: cleanLabel(verbCap + " logs..."), Total: 0}
@@ -830,6 +842,13 @@ func main() {
 			os.Exit(1)
 		}
 		allPodContainers = runPhase2Clean(appPods, *namespace, t2)
+
+		// Update t3 label with the total stream count now that it's known.
+		totalStreams := 0
+		for _, pc := range allPodContainers {
+			totalStreams += len(pc.containers)
+		}
+		t3.UpdateMessage(cleanLabel(fmt.Sprintf("%s logs...  (%d streams)", verbCap, totalStreams)))
 	} else {
 		appPods = runPhase1(apps, *namespace)
 		if len(appPods) == 0 {
@@ -858,14 +877,16 @@ func main() {
 		streamTimeout: *streamTimeout,
 	}
 
-	if cfg.since != "" {
-		fmt.Printf("Showing historical logs from %s to now for %d pods and their containers.\n", cfg.since, len(appPods))
-	} else {
-		fmt.Printf("Starting log tailing for %d pods and their containers.\n", len(appPods))
+	if *verbose {
+		if cfg.since != "" {
+			fmt.Printf("Showing historical logs from %s to now for %d pods and their containers.\n", cfg.since, len(appPods))
+		} else {
+			fmt.Printf("Starting log tailing for %d pods and their containers.\n", len(appPods))
+		}
+		fmt.Printf("Logs are being saved to: %s\n", outPath)
+		fmt.Println("Press Ctrl+C to stop all log streams")
+		fmt.Println("----------------------------------------")
 	}
-	fmt.Printf("Logs are being saved to: %s\n", outPath)
-	fmt.Println("Press Ctrl+C to stop all log streams")
-	fmt.Println("----------------------------------------")
 
 	// ── Signal handler ──────────────────────────────────────────────────────
 	var streamsStore atomic.Value
