@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -64,12 +65,13 @@ type podContainers struct {
 
 // streamConfig holds the shared, read-only parameters for every log stream.
 type streamConfig struct {
-	follow      bool
-	since       string
-	namespace   string
-	grepPattern string
-	outFile     *os.File
-	mu          *sync.Mutex
+	follow        bool
+	since         string
+	namespace     string
+	grepPattern   string
+	outFile       *os.File
+	mu            *sync.Mutex
+	streamTimeout time.Duration // 0 = unlimited; only applied in collect mode
 }
 
 // ─── Phase monitor (finding pods / fetching containers) ──────────────────────
@@ -196,25 +198,28 @@ type streamState struct {
 	app, pod, container string
 	count               int64     // updated atomically
 	done                int32     // 1 when kubectl exits, set atomically
+	timedOut            int32     // 1 if stream was cut by per-stream timeout
 	errMsg              string    // written once before markDone; safe to read after isDone
 	launchedAt          time.Time // wall time when goroutine started
 	startedAt           time.Time // wall time when first log line received; zero if no lines
 	lastAt              time.Time // wall time when last log line received
 }
 
-func (s *streamState) addLines(n int64)    { atomic.AddInt64(&s.count, n) }
-func (s *streamState) markDone()           { atomic.StoreInt32(&s.done, 1) }
-func (s *streamState) isDone() bool        { return atomic.LoadInt32(&s.done) == 1 }
-func (s *streamState) lineCount() int64    { return atomic.LoadInt64(&s.count) }
-func (s *streamState) setError(msg string) { s.errMsg = msg }
-func (s *streamState) isFailed() bool      { return s.errMsg != "" }
+func (s *streamState) addLines(n int64)     { atomic.AddInt64(&s.count, n) }
+func (s *streamState) markDone()            { atomic.StoreInt32(&s.done, 1) }
+func (s *streamState) isDone() bool         { return atomic.LoadInt32(&s.done) == 1 }
+func (s *streamState) lineCount() int64     { return atomic.LoadInt64(&s.count) }
+func (s *streamState) setError(msg string)  { s.errMsg = msg }
+func (s *streamState) isFailed() bool       { return s.errMsg != "" }
+func (s *streamState) markTimedOut()        { atomic.StoreInt32(&s.timedOut, 1) }
+func (s *streamState) isTimedOut() bool     { return atomic.LoadInt32(&s.timedOut) == 1 }
 
 // statusLabel returns a short human-readable status for a pending stream.
 func (s *streamState) statusLabel() string {
-	if !s.startedAt.IsZero() {
-		return fmt.Sprintf("streaming · %d lines", s.lineCount())
-	}
 	elapsed := time.Since(s.launchedAt).Round(time.Second)
+	if !s.startedAt.IsZero() {
+		return fmt.Sprintf("streaming · %d lines · %s", s.lineCount(), elapsed)
+	}
 	return fmt.Sprintf("waiting for logs… (%s)", elapsed)
 }
 
@@ -223,6 +228,13 @@ func (s *streamState) statusLabel() string {
 func streamLogs(st *streamState, cfg streamConfig) {
 	defer st.markDone()
 	st.launchedAt = time.Now()
+
+	ctx := context.Background()
+	var cancel context.CancelFunc = func() {}
+	if !cfg.follow && cfg.streamTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cfg.streamTimeout)
+	}
+	defer cancel()
 
 	args := kubectlArgs(cfg.namespace, "logs")
 	if cfg.follow {
@@ -234,7 +246,7 @@ func streamLogs(st *streamState, cfg streamConfig) {
 	args = append(args, st.pod, "-c", st.container)
 
 	var stderrBuf bytes.Buffer
-	cmd := exec.Command("kubectl", args...)
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		st.setError(fmt.Sprintf("stdout pipe: %v", err))
@@ -278,6 +290,11 @@ func streamLogs(st *streamState, cfg streamConfig) {
 	}
 
 	if err := cmd.Wait(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			// Timeout fired — keep whatever was collected, not an error.
+			st.markTimedOut()
+			return
+		}
 		msg := strings.TrimSpace(stderrBuf.String())
 		if msg == "" {
 			msg = err.Error()
@@ -366,6 +383,12 @@ func displayMonitor(streams []*streamState, since string) {
 				if e.st.isFailed() {
 					e.tracker.UpdateMessage(base + "  " + text.FgRed.Sprint(truncate(e.st.errMsg, 60)))
 					e.tracker.MarkAsErrored()
+				} else if e.st.isTimedOut() {
+					e.tracker.UpdateMessage(fmt.Sprintf("%s  %s",
+						base,
+						text.FgYellow.Sprintf("timed out · %d lines", e.st.lineCount()),
+					))
+					e.tracker.MarkAsDone()
 				} else {
 					e.tracker.UpdateMessage(fmt.Sprintf("%s  %s",
 						base,
@@ -438,6 +461,7 @@ func printSummary(streams []*streamState) {
 		containers []*streamState
 		lines      int64
 		errors     int
+		timedOuts  int
 	}
 
 	groups := map[string]*appGroup{}
@@ -453,6 +477,9 @@ func printSummary(streams []*streamState) {
 		g.lines += st.lineCount()
 		if st.isFailed() {
 			g.errors++
+		}
+		if st.isTimedOut() {
+			g.timedOuts++
 		}
 	}
 	sort.Strings(appOrder)
@@ -494,10 +521,15 @@ func printSummary(streams []*streamState) {
 		if g.errors > 0 {
 			errSuffix = "  " + text.FgRed.Sprintf("(%d err)", g.errors)
 		}
-		fmt.Printf("\n  %s  %s%s\n",
+		timeoutSuffix := ""
+		if g.timedOuts > 0 {
+			timeoutSuffix = "  " + text.FgYellow.Sprintf("(%d timed out)", g.timedOuts)
+		}
+		fmt.Printf("\n  %s  %s%s%s\n",
 			text.Bold.Sprint(app),
 			text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s) · %d lines", len(g.pods), len(g.containers), g.lines),
 			errSuffix,
+			timeoutSuffix,
 		)
 		if podPrefix != "" {
 			fmt.Printf("  %s\n", text.FgHiBlack.Sprintf("pod prefix: %s", podPrefix))
@@ -521,6 +553,8 @@ func printSummary(streams []*streamState) {
 			var icon string
 			if st.isFailed() {
 				icon = text.FgRed.Sprint("✗")
+			} else if st.isTimedOut() {
+				icon = text.FgYellow.Sprint("⏱")
 			} else {
 				icon = text.FgGreen.Sprint("✔")
 			}
@@ -528,6 +562,9 @@ func printSummary(streams []*streamState) {
 			if !st.startedAt.IsZero() {
 				timeRange = fmt.Sprintf("%s → %s",
 					st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
+				if st.isTimedOut() {
+					timeRange += " (cut)"
+				}
 			} else if st.isFailed() {
 				timeRange = truncate(st.errMsg, 30)
 			}
@@ -556,14 +593,15 @@ func printSummary(streams []*streamState) {
 
 func main() {
 	var (
-		namespace   = flag.String("n", "", "Kubernetes namespace")
-		since       = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
-		grepPattern = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
-		errorsOnly  = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
-		outputFile  = flag.String("o", defaultOutput, "Output file name (-o alone uses the default)")
+		namespace     = flag.String("n", "", "Kubernetes namespace")
+		since         = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
+		grepPattern   = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
+		errorsOnly    = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
+		outputFile    = flag.String("o", defaultOutput, "Output file name (-o alone uses the default)")
+		streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -581,6 +619,7 @@ func main() {
 			grepPattern = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
 			errorsOnly = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
 			outputFile = flag.String("o", defaultOutput, "Output file name")
+			streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
 			flag.Parse()
 			break
 		}
@@ -615,12 +654,13 @@ func main() {
 
 	var fileMu sync.Mutex
 	cfg := streamConfig{
-		follow:      *since == "",
-		since:       *since,
-		namespace:   *namespace,
-		grepPattern: pattern,
-		outFile:     outFile,
-		mu:          &fileMu,
+		follow:        *since == "",
+		since:         *since,
+		namespace:     *namespace,
+		grepPattern:   pattern,
+		outFile:       outFile,
+		mu:            &fileMu,
+		streamTimeout: *streamTimeout,
 	}
 
 	if cfg.since != "" {
