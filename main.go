@@ -36,6 +36,10 @@ const (
 
 var braille = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// pendingLinesDrawn tracks how many lines below the spinner are currently
+// on screen so the signal handler can erase them cleanly on Ctrl+C.
+var pendingLinesDrawn atomic.Int32
+
 func termWidth() int {
 	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
 		return w
@@ -205,6 +209,7 @@ type streamState struct {
 	count               int64     // updated atomically
 	done                int32     // 1 when kubectl exits, set atomically
 	errMsg              string    // written once before markDone; safe to read after isDone
+	launchedAt          time.Time // wall time when goroutine started
 	startedAt           time.Time // wall time when first log line received; zero if no lines
 	lastAt              time.Time // wall time when last log line received
 }
@@ -216,10 +221,20 @@ func (s *streamState) lineCount() int64    { return atomic.LoadInt64(&s.count) }
 func (s *streamState) setError(msg string) { s.errMsg = msg }
 func (s *streamState) isFailed() bool      { return s.errMsg != "" }
 
+// statusLabel returns a short human-readable status for a pending stream.
+func (s *streamState) statusLabel() string {
+	if !s.startedAt.IsZero() {
+		return fmt.Sprintf("streaming · %d lines", s.lineCount())
+	}
+	elapsed := time.Since(s.launchedAt).Round(time.Second)
+	return fmt.Sprintf("waiting for logs… (%s)", elapsed)
+}
+
 // ─── Log streaming ────────────────────────────────────────────────────────────
 
 func streamLogs(st *streamState, cfg streamConfig) {
 	defer st.markDone()
+	st.launchedAt = time.Now()
 
 	args := kubectlArgs(cfg.namespace, "logs")
 	if cfg.follow {
@@ -366,14 +381,49 @@ func displayMonitor(streams []*streamState, since string) {
 		}
 	}
 
+	const maxPendingShown = 5
+	prevLines := 0 // spinner line + detail lines drawn on the previous tick
+
 	for doneCount < total {
 		select {
 		case <-ticker.C:
+			// Erase the spinner + detail lines from the previous tick.
+			if prevLines > 0 {
+				fmt.Printf("\033[%dA\r\033[J", prevLines)
+			}
 			printReady()
 			if doneCount < total {
 				spin := braille[spinIdx%len(braille)]
 				spinIdx++
 				printSpinner(spin, fmt.Sprintf("%s logs... (%d/%d streams done)", verb, doneCount, total))
+
+				// Collect still-pending streams for the detail sub-display.
+				var pending []*streamState
+				for _, st := range sorted {
+					if !st.isDone() {
+						pending = append(pending, st)
+					}
+				}
+				limit := len(pending)
+				if limit > maxPendingShown {
+					limit = maxPendingShown
+				}
+				shown := 0
+				for _, st := range pending[:limit] {
+					fmt.Printf("\n    [%s%s%s] %s  %s%s%s",
+						ansiCyan, truncate(st.pod, 45), ansiReset,
+						st.container,
+						ansiDim, st.statusLabel(), ansiReset)
+					shown++
+				}
+				if len(pending) > maxPendingShown {
+					fmt.Printf("\n    %s… and %d more pending%s", ansiDim, len(pending)-maxPendingShown, ansiReset)
+					shown++
+				}
+				prevLines = shown
+				pendingLinesDrawn.Store(int32(prevLines))
+			} else {
+				prevLines = 0
 			}
 		}
 	}
@@ -382,8 +432,25 @@ func displayMonitor(streams []*streamState, since string) {
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
+// longestCommonPrefix returns the longest common prefix of all strings in ss.
+func longestCommonPrefix(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	prefix := ss[0]
+	for _, s := range ss[1:] {
+		for !strings.HasPrefix(s, prefix) {
+			prefix = prefix[:len(prefix)-1]
+			if prefix == "" {
+				return ""
+			}
+		}
+	}
+	return prefix
+}
+
 // printSummary prints a per-app breakdown with per-container detail,
-// including line counts and first/last log timestamps.
+// including line counts and first/last log timestamps, in aligned columns.
 func printSummary(streams []*streamState) {
 	if len(streams) == 0 {
 		return
@@ -430,7 +497,9 @@ func printSummary(streams []*streamState) {
 	}
 
 	const tsLayout = "15:04:05"
-	sep := "  " + strings.Repeat("─", 72)
+	const colLines = 7  // width for right-aligned line count
+	const colTime = 19  // "HH:MM:SS → HH:MM:SS"
+	const indent = "    "
 
 	fmt.Printf("\n%s── Summary%s\n", ansiBold, ansiReset)
 	for _, app := range appOrder {
@@ -443,32 +512,68 @@ func printSummary(streams []*streamState) {
 			ansiBold, app, ansiReset,
 			ansiDim, len(g.pods), len(g.containers), g.lines, errPart, ansiReset)
 
-		for _, st := range g.containers {
-			if st.isFailed() {
-				fmt.Printf("    %s✗%s [%s%s%s] %-22s  %s%s%s\n",
-					ansiRed, ansiReset,
-					ansiCyan, st.pod, ansiReset,
-					st.container,
-					ansiDim, truncate(st.errMsg, 50), ansiReset)
-			} else {
-				ts := ""
-				if !st.startedAt.IsZero() {
-					ts = fmt.Sprintf("  %s%s → %s%s",
-						ansiDim,
-						st.startedAt.Format(tsLayout),
-						st.lastAt.Format(tsLayout),
-						ansiReset)
-				}
-				fmt.Printf("    %s✔%s [%s%s%s] %-22s  %8d lines%s\n",
-					ansiGreen, ansiReset,
-					ansiCyan, st.pod, ansiReset,
-					st.container,
-					st.lineCount(),
-					ts)
+		// Compute shortest unique pod label by stripping the common prefix.
+		allPodNames := make([]string, len(g.containers))
+		for i, st := range g.containers {
+			allPodNames[i] = st.pod
+		}
+		podPrefix := longestCommonPrefix(allPodNames)
+		// Only strip if it saves meaningful space; keep at least 1 char.
+		if len(podPrefix) > 0 && len(podPrefix) >= len(allPodNames[0])-1 {
+			podPrefix = "" // all pods identical — would strip everything
+		}
+
+		// Compute column widths from actual data.
+		maxPod, maxContainer := len("POD"), len("CONTAINER")
+		for i, st := range g.containers {
+			shortPod := strings.TrimPrefix(allPodNames[i], podPrefix)
+			if len(shortPod) > maxPod {
+				maxPod = len(shortPod)
+			}
+			if len(st.container) > maxContainer {
+				maxContainer = len(st.container)
 			}
 		}
+
+		// Show the stripped prefix so users can reconstruct the full name.
+		if podPrefix != "" {
+			fmt.Printf("%s%spod prefix: %s%s\n", indent, ansiDim, podPrefix, ansiReset)
+		}
+
+		// Column header.
+		totalRowWidth := maxPod + 2 + maxContainer + 2 + colLines + 2 + colTime
+		fmt.Printf("%s%s%-*s  %-*s  %*s  %-*s%s\n",
+			indent, ansiDim,
+			maxPod, "POD",
+			maxContainer, "CONTAINER",
+			colLines, "LINES",
+			colTime, "TIME RANGE",
+			ansiReset)
+		fmt.Printf("%s%s%s%s\n", indent, ansiDim, strings.Repeat("─", totalRowWidth), ansiReset)
+
+		// Data rows.
+		for i, st := range g.containers {
+			shortPod := strings.TrimPrefix(allPodNames[i], podPrefix)
+			statusColor, statusIcon := ansiGreen, "✔"
+			if st.isFailed() {
+				statusColor, statusIcon = ansiRed, "✗"
+			}
+			timeRange := ""
+			if !st.startedAt.IsZero() {
+				timeRange = fmt.Sprintf("%s → %s", st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
+			} else if st.isFailed() {
+				timeRange = truncate(st.errMsg, colTime)
+			}
+			fmt.Printf("%s%s%s%s %-*s  %s%-*s%s  %*d  %s%-*s%s\n",
+				indent,
+				statusColor, statusIcon, ansiReset,
+				maxPod, shortPod,
+				ansiCyan, maxContainer, st.container, ansiReset,
+				colLines, st.lineCount(),
+				ansiDim, colTime, timeRange, ansiReset)
+		}
 	}
-	fmt.Println()
+	sep := "\n  " + strings.Repeat("─", 72)
 	fmt.Println(sep)
 	fmt.Printf("  TOTAL   %d pod(s)   %d stream(s)   %d lines\n", totalPods, totalContainers, totalLines)
 }
@@ -559,6 +664,10 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
+		// Erase any pending-stream detail lines still on screen.
+		if n := int(pendingLinesDrawn.Load()); n > 0 {
+			fmt.Printf("\033[%dA\r\033[J", n)
+		}
 		fmt.Printf("\r%s\n%sCtrl+C received — stopping all log streams...%s\n",
 			ansiClearL, ansiYellow, ansiReset)
 		outFile.Close()
