@@ -10,11 +10,11 @@ import (
 	"github.com/jedib0t/go-pretty/v6/text"
 )
 
-// activePW holds the progress.Writer currently rendering on screen so the
-// signal handler can stop it cleanly before printing the Ctrl+C banner.
+// activeStop holds a func() that stops whichever progress.Writer is currently
+// rendering, so the signal handler can halt it before printing the Ctrl+C banner.
 var (
-	activePWMu sync.Mutex
-	activePW   progress.Writer
+	activePWMu  sync.Mutex
+	activeStop  func()
 )
 
 // clearLine erases the current terminal line and moves cursor to column 0.
@@ -139,13 +139,13 @@ func displayMonitor(streams []*streamState, since string) {
 	}
 	pw.AppendTracker(overall)
 
-	// Register as the active writer for signal-handler cleanup.
+	// Register a stop function for signal-handler cleanup.
 	activePWMu.Lock()
-	activePW = pw
+	activeStop = pw.Stop
 	activePWMu.Unlock()
 	defer func() {
 		activePWMu.Lock()
-		activePW = nil
+		activeStop = nil
 		activePWMu.Unlock()
 	}()
 
@@ -225,14 +225,18 @@ func displayMonitor(streams []*streamState, since string) {
 // ─── Clean-mode progress helpers ─────────────────────────────────────────────
 
 // cleanLabel returns a bold, fixed-width label for clean-mode progress bars
-// so all three bars start at the same horizontal column.
-// Width 36 covers the longest possible expanded label:
-//
-//	"Fetching containers... (999/999)" = 32 chars
+// so all three bars start at the same horizontal column. The width is computed
+// lazily from the longest label passed in across all three phases so it adapts
+// automatically to any label text length.
 func cleanLabel(s string) string {
-	const labelWidth = 36
-	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", labelWidth, s)))
+	if len(s) > cleanLabelWidth {
+		cleanLabelWidth = len(s)
+	}
+	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", cleanLabelWidth, s)))
 }
+
+// cleanLabelWidth tracks the widest label seen so far so all bars align.
+var cleanLabelWidth int
 
 // displayMonitorClean is like displayMonitor but updates an existing tracker
 // without appending per-stream rows — default mode (use -verbose for detail).

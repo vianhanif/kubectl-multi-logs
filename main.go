@@ -37,6 +37,15 @@ func truncate(s string, n int) string {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
+	// Pre-process bare "-o" (no following value) before flag.Parse so we only
+	// parse once. The flag package would otherwise error on the next token.
+	for i, arg := range os.Args[1:] {
+		if arg == "-o" {
+			os.Args[i+1] = "-o=" + defaultOutput
+			break
+		}
+	}
+
 	var (
 		namespace     = flag.String("n", "", "Kubernetes namespace")
 		since         = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
@@ -51,26 +60,6 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-
-	// Bare -o with no value: default is already set by flag package; nothing to do.
-	// If the user passed -o without a filename the flag package would have errored,
-	// so we handle it by scanning for the bare token before Parse.
-	for i, arg := range os.Args[1:] {
-		if arg == "-o" {
-			os.Args[i+1] = "-o=" + defaultOutput
-			// Re-parse with the corrected arg.
-			flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-			namespace = flag.String("n", "", "Kubernetes namespace")
-			since = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
-			grepPattern = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
-			errorsOnly = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
-			outputFile = flag.String("o", defaultOutput, "Output file name")
-			streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
-			verbose = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
-			flag.Parse()
-			break
-		}
-	}
 
 	apps := flag.Args()
 	if len(apps) == 0 {
@@ -114,7 +103,7 @@ func main() {
 		pw.AppendTracker(t2)
 		pw.AppendTracker(t3)
 		activePWMu.Lock()
-		activePW = pw
+		activeStop = pw.Stop
 		activePWMu.Unlock()
 		go pw.Render()
 		cleanPW = pw
@@ -182,10 +171,10 @@ func main() {
 		// Stop any live progress writer so its render loop doesn't race
 		// with the Ctrl+C banner we're about to print.
 		activePWMu.Lock()
-		pw := activePW
+		stop := activeStop
 		activePWMu.Unlock()
-		if pw != nil {
-			pw.Stop()
+		if stop != nil {
+			stop()
 		}
 		clearLine()
 		fmt.Printf("\n%s\n", text.FgYellow.Sprint("Ctrl+C received — stopping all log streams..."))
@@ -205,7 +194,7 @@ func main() {
 		displayMonitorClean(streams, verbCap, cleanT3)
 		cleanPW.Stop()
 		activePWMu.Lock()
-		activePW = nil
+		activeStop = nil
 		activePWMu.Unlock()
 	} else {
 		displayMonitor(streams, cfg.since)
