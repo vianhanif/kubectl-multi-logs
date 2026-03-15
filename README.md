@@ -12,6 +12,8 @@ Tail logs from multiple Kubernetes pods simultaneously — real-time or historic
 - **Flexible filtering**: Case-insensitive pattern matching with `|` OR support; dedicated `-e` flag for errors.
 - **Organised output**: Lines prefixed with `[pod:container]` for easy grepping.
 - **Brew-style live progress**: Scroll-and-advance terminal UI — each item prints a permanent ✔ line as it completes, grouped by app, with a live spinner for remaining streams.
+- **Fixed semantic coloring**: Pod names are always cyan; container names are plain — consistent and easy to scan without distracting per-app palette shifts.
+- **Exit summary with timestamps**: On completion a per-container summary table shows pod, container, line count, and `HH:MM:SS → HH:MM:SS` first/last log timestamps.
 - **Single binary**: No shell runtime required — just `kubectl` on `$PATH`.
 
 ## Installation
@@ -129,6 +131,29 @@ Press Ctrl+C to stop all log streams
 
 Historical logs collection completed. Logs saved to: /path/to/tail_multiple_logs_data.log
 ```
+
+Pod names are displayed in **cyan**; container names are in plain text — fixed colors regardless of which apps are being tailed.
+
+**Summary** (printed on completion or Ctrl+C):
+```
+── Summary
+
+  agent-service  2 pod(s) · 2 stream(s) · 3108 lines
+    ✔ [agent-service-deployment-7b54bf66c7-2f79w] agent-service            1557 lines  10:12:03 → 10:22:41
+    ✔ [agent-service-deployment-7b54bf66c7-425mh] agent-service            1551 lines  10:12:04 → 10:22:39
+
+  agent-service-worker  1 pod(s) · 2 stream(s) · 214 lines
+    ✔ [agent-service-worker-deployment-6b5b6cbdf7-bbkll] agent-cron-worker   153 lines  10:12:05 → 10:22:10
+    ✔ [agent-service-worker-deployment-6b5b6cbdf7-bbkll] agent-service-worker  61 lines  10:12:05 → 10:20:44
+
+  tez-api  1 pod(s) · 1 stream(s) · 14504 lines
+    ✔ [tez-api-deployment-77d5fb6445-hknxx] tez-api                        14504 lines  10:12:01 → 10:22:58
+
+  ────────────────────────────────────────────────────────────────────────
+  TOTAL   4 pod(s)   5 stream(s)   17826 lines
+```
+
+Failed streams show `✗` with a truncated error message instead of line counts and timestamps.
 
 ### Log File Output
 
