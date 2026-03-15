@@ -327,9 +327,22 @@ func main() {
 		outputFile  = flag.String("o", "tail_multiple_logs_data.log", "Output file name")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-g pattern] [-e] [-o output_file] <app1> <app2> ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  -o alone uses the default filename; -o=myfile.log sets a custom name.\n")
 		flag.PrintDefaults()
 	}
+
+	// Pre-process os.Args so that bare -o (no attached value) uses the default
+	// filename, matching bash getopts "o::" (optional-argument) behaviour.
+	// -o alone            → -o=tail_multiple_logs_data.log
+	// -o=custom.log       → unchanged (flag package handles it)
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "-o" {
+			os.Args[i] = "-o=tail_multiple_logs_data.log"
+			break
+		}
+	}
+
 	flag.Parse()
 
 	apps := flag.Args()
