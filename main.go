@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 )
@@ -27,9 +28,12 @@ const defaultOutput = "tail_multiple_logs_data.log"
 
 var braille = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-// pendingLinesDrawn tracks how many detail lines are below the spinner so
-// the signal handler can erase them cleanly on Ctrl+C.
-var pendingLinesDrawn atomic.Int32
+// activePW holds the progress.Writer currently rendering on screen so the
+// signal handler can stop it cleanly before printing the Ctrl+C banner.
+var (
+	activePWMu sync.Mutex
+	activePW   progress.Writer
+)
 
 // clearLine erases the current terminal line and moves cursor to column 0.
 func clearLine() { fmt.Print("\r\033[K") }
@@ -79,52 +83,77 @@ type phaseItem struct {
 	ok     bool
 }
 
-// printPhaseResult prints one completed phase item as a permanent line.
-func printPhaseResult(item phaseItem) {
-	var icon string
-	if item.ok {
-		icon = text.FgGreen.Sprint("✔")
-	} else {
-		icon = text.FgRed.Sprint("✗")
+// newPW returns a configured progress.Writer ready to use.
+func newPW() progress.Writer {
+	pw := progress.NewWriter()
+	pw.SetAutoStop(false)
+	pw.SetStyle(progress.StyleBlocks)
+	pw.Style().Colors = progress.StyleColors{
+		Message: text.Colors{},
+		Error:   text.Colors{text.FgRed},
+		Stats:   text.Colors{text.FgHiBlack},
+		Time:    text.Colors{text.FgHiBlack},
+		Tracker: text.Colors{text.FgHiBlack},
+		Value:   text.Colors{text.FgHiBlack},
+		Speed:   text.Colors{text.FgHiBlack},
 	}
-	clearLine()
-	fmt.Printf("  %s  %-52s  %s\n", icon, item.label, text.FgHiBlack.Sprint(item.result))
+	pw.Style().Chars.Finished = "✔"
+	pw.Style().Options.DoneString = ""
+	pw.Style().Options.ErrorString = ""
+	pw.Style().Visibility = progress.StyleVisibility{
+		Time:           true,
+		Tracker:        true,
+		Value:          false,
+		Percentage:     false,
+		ETA:            false,
+		ETAOverall:     false,
+		Speed:          false,
+		SpeedOverall:   false,
+		TrackerOverall: false,
+	}
+	pw.SetTrackerPosition(progress.PositionRight)
+	pw.SetUpdateFrequency(80 * time.Millisecond)
+	return pw
 }
 
-// phaseMonitor prints items one-by-one as they arrive, with a live spinner
-// at the bottom. Blocks until all tasks complete.
+// phaseMonitor shows a live progress bar for a batch of parallel tasks.
+// One real progress bar tracks overall completions; individual item trackers
+// are appended and immediately marked done as each result arrives (one-by-one).
 func phaseMonitor(labels []string, doneCh <-chan phaseItem) {
 	total := len(labels)
-	printed := 0
-	spinIdx := 0
-	ticker := time.NewTicker(80 * time.Millisecond)
-	defer ticker.Stop()
+	pw := newPW()
 
-	drain := func() {
-		for {
-			select {
-			case item := <-doneCh:
-				printPhaseResult(item)
-				printed++
-			default:
-				return
-			}
+	overall := &progress.Tracker{
+		Message: fmt.Sprintf("  0 / %d done", total),
+		Total:   int64(total),
+	}
+	pw.AppendTracker(overall)
+	go pw.Render()
+
+	for i := range labels {
+		item := <-doneCh
+		resultStr := text.FgHiBlack.Sprint(item.result)
+		if !item.ok {
+			resultStr = text.FgRed.Sprint(item.result)
+		}
+		// Append individual item — Total:0 means no bar is shown for it.
+		t := &progress.Tracker{
+			Message: fmt.Sprintf("  %-52s  %s", item.label, resultStr),
+			Total:   0,
+		}
+		pw.AppendTracker(t)
+		if item.ok {
+			t.MarkAsDone()
+		} else {
+			t.MarkAsErrored()
+		}
+		overall.Increment(1)
+		if n := i + 1; n < total {
+			overall.UpdateMessage(fmt.Sprintf("  %d / %d done", n, total))
 		}
 	}
-
-	for printed < total {
-		select {
-		case item := <-doneCh:
-			printPhaseResult(item)
-			printed++
-		case <-ticker.C:
-			drain()
-			spin := braille[spinIdx%len(braille)]
-			spinIdx++
-			printSpinner(spin, fmt.Sprintf("waiting for %d more…", total-printed))
-		}
-	}
-	clearLine()
+	overall.MarkAsDone()
+	pw.Stop()
 }
 
 // ─── Kubernetes helpers ───────────────────────────────────────────────────────
@@ -301,9 +330,10 @@ func matchesPattern(text, pattern string) bool {
 
 // ─── Display monitor (Phase 3) ────────────────────────────────────────────────
 
-// displayMonitor prints log-stream results one-by-one as they complete.
-// A single spinner line at the bottom shows live status of pending streams.
-// Blocks until all streams are done.
+// displayMonitor tracks every log stream with a go-pretty progress display.
+// One real progress bar shows overall completion; streams are appended and
+// immediately marked done one-by-one as they finish, so the list grows
+// incrementally rather than rendering all at once.
 func displayMonitor(streams []*streamState, since string) {
 	// Sort by app then pod for consistent grouping.
 	sorted := make([]*streamState, len(streams))
@@ -316,13 +346,6 @@ func displayMonitor(streams []*streamState, since string) {
 	})
 
 	total := len(sorted)
-	printedApp := map[string]bool{}
-	printedStream := make([]bool, total)
-	doneCount := 0
-	spinIdx := 0
-	ticker := time.NewTicker(80 * time.Millisecond)
-	defer ticker.Stop()
-
 	verb := "collected"
 	verbCap := "Collecting"
 	if since == "" {
@@ -330,89 +353,95 @@ func displayMonitor(streams []*streamState, since string) {
 		verbCap = "Following"
 	}
 
-	// printReady flushes any newly-finished streams as permanent lines.
-	printReady := func() {
+	pw := newPW()
+
+	overall := &progress.Tracker{
+		Message: fmt.Sprintf("  %s logs… (0 / %d done)", verbCap, total),
+		Total:   int64(total),
+	}
+	pw.AppendTracker(overall)
+
+	// Register as the active writer for signal-handler cleanup.
+	activePWMu.Lock()
+	activePW = pw
+	activePWMu.Unlock()
+	defer func() {
+		activePWMu.Lock()
+		activePW = nil
+		activePWMu.Unlock()
+	}()
+
+	go pw.Render()
+
+	printedApp := map[string]bool{}
+	printedStream := make([]bool, total)
+	doneCount := 0
+	ticker := time.NewTicker(80 * time.Millisecond)
+	defer ticker.Stop()
+
+	for doneCount < total {
+		<-ticker.C
+
+		// Flush newly-finished streams as permanent trackers.
 		for i, st := range sorted {
 			if printedStream[i] || !st.isDone() {
 				continue
 			}
+			// App section header — printed once per app.
 			if !printedApp[st.app] {
-				clearLine()
-				fmt.Println("  " + text.Bold.Sprint(st.app))
+				sep := &progress.Tracker{
+					Message: "  " + text.Bold.Sprint(st.app),
+					Total:   0,
+				}
+				pw.AppendTracker(sep)
+				sep.MarkAsDone()
 				printedApp[st.app] = true
 			}
-			clearLine()
+			// Stream result tracker.
+			var msg string
+			switch {
+			case st.isFailed():
+				msg = fmt.Sprintf("    [%s] %s  %s",
+					text.FgCyan.Sprint(st.pod), st.container,
+					text.FgRed.Sprint(truncate(st.errMsg, 60)))
+			case st.isTimedOut():
+				msg = fmt.Sprintf("    [%s] %s  %s",
+					text.FgCyan.Sprint(st.pod), st.container,
+					text.FgYellow.Sprintf("timed out · %d lines", st.lineCount()))
+			default:
+				msg = fmt.Sprintf("    [%s] %s  %s",
+					text.FgCyan.Sprint(st.pod), st.container,
+					text.FgHiBlack.Sprintf("%s · %d lines", verb, st.lineCount()))
+			}
+			t := &progress.Tracker{Message: msg, Total: 0}
+			pw.AppendTracker(t)
 			if st.isFailed() {
-				fmt.Printf("    %s  [%s] %s  %s\n",
-					text.FgRed.Sprint("✗"),
-					text.FgCyan.Sprint(st.pod),
-					st.container,
-					text.FgHiBlack.Sprint(truncate(st.errMsg, 60)),
-				)
-			} else if st.isTimedOut() {
-				fmt.Printf("    %s  [%s] %s  %s\n",
-					text.FgYellow.Sprint("⏱"),
-					text.FgCyan.Sprint(st.pod),
-					st.container,
-					text.FgHiBlack.Sprintf("timed out · %d lines", st.lineCount()),
-				)
+				t.MarkAsErrored()
 			} else {
-				fmt.Printf("    %s  [%s] %s  %s\n",
-					text.FgGreen.Sprint("✔"),
-					text.FgCyan.Sprint(st.pod),
-					st.container,
-					text.FgHiBlack.Sprintf("%s · %d lines", verb, st.lineCount()),
-				)
+				t.MarkAsDone()
 			}
 			printedStream[i] = true
 			doneCount++
+			overall.Increment(1)
 		}
-	}
 
-	const maxPendingShown = 5
-	prevLines := 0
-
-	for doneCount < total {
-		<-ticker.C
-		// Erase spinner + detail lines from the previous tick.
-		if prevLines > 0 {
-			fmt.Printf("\033[%dA\r\033[J", prevLines)
-		}
-		printReady()
+		// Keep the overall tracker message fresh with the slowest pending stream.
 		if doneCount < total {
-			spin := braille[spinIdx%len(braille)]
-			spinIdx++
-			printSpinner(spin, fmt.Sprintf("%s logs… (%d/%d done)", verbCap, doneCount, total))
-
-			var pending []*streamState
+			var slowest *streamState
 			for _, st := range sorted {
-				if !st.isDone() {
-					pending = append(pending, st)
+				if !st.isDone() && (slowest == nil || st.launchedAt.Before(slowest.launchedAt)) {
+					slowest = st
 				}
 			}
-			limit := len(pending)
-			if limit > maxPendingShown {
-				limit = maxPendingShown
+			msg := fmt.Sprintf("  %s logs… (%d / %d done)", verbCap, doneCount, total)
+			if slowest != nil {
+				msg += "  ·  " + text.FgHiBlack.Sprintf("[%s] %s",
+					truncate(slowest.pod, 28), slowest.statusLabel())
 			}
-			shown := 0
-			for _, st := range pending[:limit] {
-				fmt.Printf("\n    [%s] %s  %s",
-					text.FgCyan.Sprint(truncate(st.pod, 45)),
-					st.container,
-					text.FgHiBlack.Sprint(st.statusLabel()))
-				shown++
-			}
-			if len(pending) > maxPendingShown {
-				fmt.Printf("\n    %s", text.FgHiBlack.Sprintf("… and %d more pending", len(pending)-maxPendingShown))
-				shown++
-			}
-			prevLines = shown
-			pendingLinesDrawn.Store(int32(prevLines))
-		} else {
-			prevLines = 0
+			overall.UpdateMessage(msg)
 		}
 	}
-	clearLine()
+	pw.Stop()
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
@@ -687,9 +716,13 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		// Erase any pending-stream detail lines still on screen.
-		if n := int(pendingLinesDrawn.Load()); n > 0 {
-			fmt.Printf("\033[%dA\r\033[J", n)
+		// Stop any live progress writer so its render loop doesn't race
+		// with the Ctrl+C banner we're about to print.
+		activePWMu.Lock()
+		pw := activePW
+		activePWMu.Unlock()
+		if pw != nil {
+			pw.Stop()
 		}
 		clearLine()
 		fmt.Printf("\n%s\n", text.FgYellow.Sprint("Ctrl+C received — stopping all log streams..."))
