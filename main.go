@@ -552,9 +552,9 @@ func printSummary(streams []*streamState) {
 	// stream rows for that app — each group is fenced by AppendSeparator().
 	t.SetColumnConfigs([]table.ColumnConfig{
 		{Number: 1, Align: text.AlignCenter},
-		{Number: 2, Align: text.AlignLeft, AutoMerge: true, Colors: text.Colors{text.Bold}},
-		{Number: 3, Align: text.AlignLeft},
-		{Number: 4, Align: text.AlignLeft},
+		{Number: 2, Align: text.AlignLeft, AutoMerge: true, Colors: text.Colors{text.Bold}, WidthMax: 36},
+		{Number: 3, Align: text.AlignLeft, WidthMax: 30},
+		{Number: 4, Align: text.AlignLeft, WidthMax: 30},
 		{Number: 5, Align: text.AlignRight},
 		{Number: 6, Align: text.AlignCenter},
 	})
@@ -574,10 +574,9 @@ func printSummary(streams []*streamState) {
 		}
 
 		// Build aggregate note for the group header row.
+		// Prefix is intentionally omitted here — it's implicit from the short
+		// suffixes shown in the stream rows, and including it widens the table.
 		aggNote := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s)", len(g.pods), len(g.containers))
-		if podPrefix != "" {
-			aggNote += text.FgHiBlack.Sprintf("  ·  prefix: %s…", podPrefix)
-		}
 		var notices []string
 		if g.errors > 0 {
 			notices = append(notices, text.FgRed.Sprintf("%d err", g.errors))
