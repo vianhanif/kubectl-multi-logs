@@ -670,8 +670,11 @@ func runPhase2Clean(pods []appPod, namespace string, tracker *progress.Tracker) 
 
 // cleanLabel returns a bold, fixed-width label for clean-mode progress bars
 // so all three bars start at the same horizontal column.
+// Width 36 covers the longest possible expanded label:
+//
+//	"Fetching containers... (999/999)" = 32 chars
 func cleanLabel(s string) string {
-	const labelWidth = 24
+	const labelWidth = 36
 	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", labelWidth, s)))
 }
 
