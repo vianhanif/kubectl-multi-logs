@@ -166,4 +166,3 @@ func runPhase2Clean(pods []appPod, namespace string, tracker *progress.Tracker) 
 	}
 	return result
 }
-
