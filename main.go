@@ -553,8 +553,8 @@ func printSummary(streams []*streamState) {
 	t.SetColumnConfigs([]table.ColumnConfig{
 		{Number: 1, Align: text.AlignCenter},
 		{Number: 2, Align: text.AlignLeft, AutoMerge: true, Colors: text.Colors{text.Bold}, WidthMax: 36},
-		{Number: 3, Align: text.AlignLeft, WidthMax: 30},
-		{Number: 4, Align: text.AlignLeft, WidthMax: 30},
+		{Number: 3, Align: text.AlignLeft},
+		{Number: 4, Align: text.AlignLeft},
 		{Number: 5, Align: text.AlignRight},
 		{Number: 6, Align: text.AlignCenter},
 	})
@@ -647,6 +647,123 @@ func printSummary(streams []*streamState) {
 	fmt.Println()
 }
 
+// ─── Clean-mode helpers ──────────────────────────────────────────────────────
+
+// runPhase1Clean is like runPhase1 but updates an existing tracker instead of
+// creating its own progress.Writer — used by -clean mode.
+func runPhase1Clean(apps []string, namespace string, tracker *progress.Tracker) []appPod {
+	var mu sync.Mutex
+	var result []appPod
+	doneCh := make(chan phaseItem, len(apps))
+	var wg sync.WaitGroup
+	for _, app := range apps {
+		app := app
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pods, err := getPodsForApp(app, namespace)
+			if err != nil || len(pods) == 0 {
+				doneCh <- phaseItem{label: app, ok: false}
+				return
+			}
+			mu.Lock()
+			for _, p := range pods {
+				result = append(result, appPod{app, p})
+			}
+			mu.Unlock()
+			doneCh <- phaseItem{label: app, ok: true}
+		}()
+	}
+	go func() { wg.Wait(); close(doneCh) }()
+	errCount := 0
+	for range apps {
+		item := <-doneCh
+		tracker.Increment(1)
+		if !item.ok {
+			errCount++
+		}
+	}
+	if errCount > 0 {
+		tracker.MarkAsErrored()
+	} else {
+		tracker.MarkAsDone()
+	}
+	return result
+}
+
+// runPhase2Clean is like runPhase2 but updates an existing tracker.
+func runPhase2Clean(pods []appPod, namespace string, tracker *progress.Tracker) []podContainers {
+	var mu sync.Mutex
+	var result []podContainers
+	tracker.UpdateTotal(int64(len(pods)))
+	doneCh := make(chan phaseItem, len(pods))
+	var wg sync.WaitGroup
+	for _, ap := range pods {
+		ap := ap
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			containers, err := getContainersForPod(ap.pod, namespace)
+			if err != nil || len(containers) == 0 {
+				doneCh <- phaseItem{label: ap.pod, ok: false}
+				return
+			}
+			mu.Lock()
+			result = append(result, podContainers{ap.app, ap.pod, containers})
+			mu.Unlock()
+			doneCh <- phaseItem{label: ap.pod, ok: true}
+		}()
+	}
+	go func() { wg.Wait(); close(doneCh) }()
+	errCount := 0
+	for range pods {
+		item := <-doneCh
+		tracker.Increment(1)
+		if !item.ok {
+			errCount++
+		}
+	}
+	if errCount > 0 {
+		tracker.MarkAsErrored()
+	} else {
+		tracker.MarkAsDone()
+	}
+	return result
+}
+
+// displayMonitorClean is like displayMonitor but updates an existing tracker
+// without appending per-stream rows — used by -clean mode.
+func displayMonitorClean(streams []*streamState, since string, tracker *progress.Tracker) {
+	total := len(streams)
+	tracker.UpdateTotal(int64(total))
+	verbCap := "Collecting"
+	if since == "" {
+		verbCap = "Following"
+	}
+	tracker.UpdateMessage(fmt.Sprintf("  %s  (0 / %d)", text.Bold.Sprint(verbCap+" logs..."), total))
+
+	printed := make([]bool, total)
+	doneCount := 0
+	ticker := time.NewTicker(80 * time.Millisecond)
+	defer ticker.Stop()
+	for doneCount < total {
+		<-ticker.C
+		for i, st := range streams {
+			if printed[i] || !st.isDone() {
+				continue
+			}
+			tracker.Increment(1)
+			printed[i] = true
+			doneCount++
+		}
+		if doneCount < total {
+			tracker.UpdateMessage(fmt.Sprintf("  %s  (%d / %d)",
+				text.Bold.Sprint(verbCap+" logs..."), doneCount, total))
+		}
+	}
+	tracker.MarkAsDone()
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -657,6 +774,7 @@ func main() {
 		errorsOnly    = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
 		outputFile    = flag.String("o", defaultOutput, "Output file name (-o alone uses the default)")
 		streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
+		clean         = flag.Bool("clean", false, "Show only 3 high-level progress bars (no per-item detail)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
@@ -678,6 +796,7 @@ func main() {
 			errorsOnly = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
 			outputFile = flag.String("o", defaultOutput, "Output file name")
 			streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
+			clean = flag.Bool("clean", false, "Show only 3 high-level progress bars (no per-item detail)")
 			flag.Parse()
 			break
 		}
@@ -695,12 +814,54 @@ func main() {
 	outPath := filepath.Join(scriptDir, *outputFile)
 
 	// ── Phase 1 & 2 ─────────────────────────────────────────────────────────
-	appPods := runPhase1(apps, *namespace)
-	if len(appPods) == 0 {
-		fmt.Fprintln(os.Stderr, "No pods found for the specified apps. Exiting.")
-		os.Exit(1)
+	var appPods []appPod
+	var allPodContainers []podContainers
+	var cleanPW progress.Writer
+	var cleanT3 *progress.Tracker
+
+	if *clean {
+		pw := newPW()
+		verbCap := "Collecting"
+		if *since == "" {
+			verbCap = "Following"
+		}
+		t1 := &progress.Tracker{
+			Message: fmt.Sprintf("  %s", text.Bold.Sprint("Finding pods...")),
+			Total:   int64(len(apps)),
+		}
+		t2 := &progress.Tracker{
+			Message: fmt.Sprintf("  %s", text.Bold.Sprint("Fetching containers...")),
+			Total:   0,
+		}
+		t3 := &progress.Tracker{
+			Message: fmt.Sprintf("  %s", text.Bold.Sprint(verbCap+" logs...")),
+			Total:   0,
+		}
+		pw.AppendTracker(t1)
+		pw.AppendTracker(t2)
+		pw.AppendTracker(t3)
+		activePWMu.Lock()
+		activePW = pw
+		activePWMu.Unlock()
+		go pw.Render()
+		cleanPW = pw
+		cleanT3 = t3
+
+		appPods = runPhase1Clean(apps, *namespace, t1)
+		if len(appPods) == 0 {
+			pw.Stop()
+			fmt.Fprintln(os.Stderr, "No pods found for the specified apps. Exiting.")
+			os.Exit(1)
+		}
+		allPodContainers = runPhase2Clean(appPods, *namespace, t2)
+	} else {
+		appPods = runPhase1(apps, *namespace)
+		if len(appPods) == 0 {
+			fmt.Fprintln(os.Stderr, "No pods found for the specified apps. Exiting.")
+			os.Exit(1)
+		}
+		allPodContainers = runPhase2(appPods, *namespace)
 	}
-	allPodContainers := runPhase2(appPods, *namespace)
 
 	// ── Open output file ────────────────────────────────────────────────────
 	outFile, err := os.Create(outPath)
@@ -758,7 +919,15 @@ func main() {
 	streamsStore.Store(streams)
 
 	start := time.Now()
-	displayMonitor(streams, cfg.since)
+	if *clean {
+		displayMonitorClean(streams, cfg.since, cleanT3)
+		cleanPW.Stop()
+		activePWMu.Lock()
+		activePW = nil
+		activePWMu.Unlock()
+	} else {
+		displayMonitor(streams, cfg.since)
+	}
 	wg.Wait()
 	elapsed := time.Since(start).Round(time.Second)
 
