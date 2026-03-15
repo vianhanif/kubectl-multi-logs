@@ -119,12 +119,14 @@ func newPW() progress.Writer {
 // phaseMonitor shows a live progress bar for a batch of parallel tasks.
 // One real progress bar tracks overall completions; individual item trackers
 // are appended and immediately marked done as each result arrives (one-by-one).
-func phaseMonitor(labels []string, doneCh <-chan phaseItem) {
+// title is shown in the overall tracker so go-pretty fully owns it and it
+// cannot be scrolled over by the growing per-item list.
+func phaseMonitor(title string, labels []string, doneCh <-chan phaseItem) {
 	total := len(labels)
 	pw := newPW()
 
 	overall := &progress.Tracker{
-		Message: fmt.Sprintf("  0 / %d done", total),
+		Message: fmt.Sprintf("  %s  0 / %d", text.Bold.Sprint(title), total),
 		Total:   int64(total),
 	}
 	pw.AppendTracker(overall)
@@ -149,7 +151,7 @@ func phaseMonitor(labels []string, doneCh <-chan phaseItem) {
 		}
 		overall.Increment(1)
 		if n := i + 1; n < total {
-			overall.UpdateMessage(fmt.Sprintf("  %d / %d done", n, total))
+			overall.UpdateMessage(fmt.Sprintf("  %s  %d / %d", text.Bold.Sprint(title), n, total))
 		}
 	}
 	overall.MarkAsDone()
@@ -793,7 +795,6 @@ func runPhase1(apps []string, namespace string) []appPod {
 	var mu sync.Mutex
 	var result []appPod
 
-	fmt.Println(text.Bold.Sprint("Finding pods for apps..."))
 	doneCh := make(chan phaseItem, len(apps))
 	var wg sync.WaitGroup
 	for _, app := range apps {
@@ -815,7 +816,7 @@ func runPhase1(apps []string, namespace string) []appPod {
 		}()
 	}
 	go func() { wg.Wait(); close(doneCh) }()
-	phaseMonitor(apps, doneCh)
+	phaseMonitor("Finding pods for apps...", apps, doneCh)
 	return result
 }
 
@@ -825,7 +826,6 @@ func runPhase2(pods []appPod, namespace string) []podContainers {
 	var mu sync.Mutex
 	var result []podContainers
 
-	fmt.Println(text.Bold.Sprint("Fetching containers for pods..."))
 	doneCh := make(chan phaseItem, len(pods))
 	var wg sync.WaitGroup
 	for _, ap := range pods {
@@ -849,7 +849,7 @@ func runPhase2(pods []appPod, namespace string) []podContainers {
 	for i, ap := range pods {
 		podLabels[i] = ap.pod
 	}
-	phaseMonitor(podLabels, doneCh)
+	phaseMonitor("Fetching containers for pods...", podLabels, doneCh)
 	return result
 }
 
