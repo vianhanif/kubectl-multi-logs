@@ -5,12 +5,13 @@ import (
 	"os"
 	"sort"
 
-	"github.com/jedib0t/go-pretty/v6/list"
+	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 )
 
-// printSummary prints a hierarchical tree summary: app → pod → container,
-// using go-pretty/list for the tree rendering with stats inline per container.
+// printSummary prints a table summary grouped by app.
+// The app name appears as a bold header row in the Pod column; each container
+// stream follows as a data row with pod, container, status, lines, and time range.
 func printSummary(streams []*streamState) {
 	if len(streams) == 0 {
 		return
@@ -66,24 +67,26 @@ func printSummary(streams []*streamState) {
 	fmt.Println(text.Bold.Sprint("── Summary"))
 	fmt.Println()
 
-	lw := list.NewWriter()
-	lw.SetOutputMirror(os.Stdout)
-	lw.SetStyle(list.StyleConnectedRounded)
+	tw := table.NewWriter()
+	tw.SetOutputMirror(os.Stdout)
+	tw.SetStyle(table.StyleRounded)
+	tw.Style().Options.SeparateRows = false
+	tw.AppendHeader(table.Row{"Pod", "Container", "", "Lines", "Time range"})
 
-	for _, app := range appOrder {
+	for i, app := range appOrder {
 		g := groups[app]
 
-		// App-level item: bold name + dim aggregate + optional error notices.
-		appMeta := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s) · %d lines",
-			len(g.pods), len(g.containers), g.lines)
+		// App header row — spans the Pod column, rest empty.
+		appMeta := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s) · %d lines", len(g.pods), len(g.containers), g.lines)
 		if g.errors > 0 {
 			appMeta += "  " + text.FgRed.Sprintf("%d err", g.errors)
 		}
 		if g.timedOuts > 0 {
 			appMeta += "  " + text.FgYellow.Sprintf("%d timed out", g.timedOuts)
 		}
-		lw.AppendItem(text.Bold.Sprint(app) + "  " + appMeta)
-		lw.Indent()
+		tw.AppendRow(table.Row{
+			text.Bold.Sprint(app) + "  " + appMeta, "", "", "", "",
+		})
 
 		// Group containers by pod, preserving sorted order.
 		var podOrder []string
@@ -96,9 +99,13 @@ func printSummary(streams []*streamState) {
 		}
 
 		for _, pod := range podOrder {
-			lw.AppendItem(text.FgHiBlack.Sprint(pod))
-			lw.Indent()
-			for _, st := range podMap[pod] {
+			for rowIdx, st := range podMap[pod] {
+				// Pod name only on the first container row for that pod.
+				podCell := ""
+				if rowIdx == 0 {
+					podCell = text.FgHiBlack.Sprint(pod)
+				}
+
 				var icon string
 				if st.isFailed() {
 					icon = text.FgRed.Sprint("✗")
@@ -107,6 +114,7 @@ func printSummary(streams []*streamState) {
 				} else {
 					icon = text.FgGreen.Sprint("✔")
 				}
+
 				timeRange := ""
 				if !st.startedAt.IsZero() {
 					timeRange = text.FgHiBlack.Sprintf("%s → %s",
@@ -117,24 +125,27 @@ func printSummary(streams []*streamState) {
 				} else if st.isFailed() {
 					timeRange = text.FgRed.Sprint(truncate(st.errMsg, 40))
 				}
-				lw.AppendItem(fmt.Sprintf("%s  %s  %s  %s",
-					icon,
+
+				tw.AppendRow(table.Row{
+					podCell,
 					text.FgCyan.Sprint(st.container),
-					text.Bold.Sprintf("%d lines", st.lineCount()),
+					icon,
+					text.Bold.Sprintf("%d", st.lineCount()),
 					timeRange,
-				))
+				})
 			}
-			lw.UnIndent()
 		}
 
-		lw.UnIndent()
+		if i < len(appOrder)-1 {
+			tw.AppendSeparator()
+		}
 	}
 
-	lw.Render()
-
-	fmt.Printf("\n  %s  %s\n\n",
+	tw.AppendFooter(table.Row{
 		text.Bold.Sprint("TOTAL"),
-		text.FgHiBlack.Sprintf("%d app(s) · %d pod(s) · %d stream(s) · %d lines",
-			len(appOrder), totalPods, totalContainers, totalLines),
-	)
+		text.FgHiBlack.Sprintf("%d app(s) · %d pod(s) · %d stream(s)", len(appOrder), totalPods, totalContainers),
+		"", text.Bold.Sprintf("%d", totalLines), "",
+	})
+	tw.Render()
+	fmt.Println()
 }
