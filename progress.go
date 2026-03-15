@@ -225,18 +225,13 @@ func displayMonitor(streams []*streamState, since string) {
 // ─── Clean-mode progress helpers ─────────────────────────────────────────────
 
 // cleanLabel returns a bold, fixed-width label for clean-mode progress bars
-// so all three bars start at the same horizontal column. The width is computed
-// lazily from the longest label passed in across all three phases so it adapts
-// automatically to any label text length.
+// so all three bars start at the same horizontal column.
+// labelWidth is derived from the widest string any of the three phases can
+// produce: "Fetching containers... (999/999)" = 32 chars → padded to 36.
 func cleanLabel(s string) string {
-	if len(s) > cleanLabelWidth {
-		cleanLabelWidth = len(s)
-	}
-	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", cleanLabelWidth, s)))
+	const labelWidth = 36
+	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", labelWidth, s)))
 }
-
-// cleanLabelWidth tracks the widest label seen so far so all bars align.
-var cleanLabelWidth int
 
 // displayMonitorClean is like displayMonitor but updates an existing tracker
 // without appending per-stream rows — default mode (use -verbose for detail).
