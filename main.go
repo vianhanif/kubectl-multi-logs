@@ -606,10 +606,13 @@ func runPhase1Clean(apps []string, namespace string, tracker *progress.Tracker) 
 		}()
 	}
 	go func() { wg.Wait(); close(doneCh) }()
-	errCount := 0
+	total := len(apps)
+	errCount, done := 0, 0
 	for range apps {
 		item := <-doneCh
+		done++
 		tracker.Increment(1)
+		tracker.UpdateMessage(cleanLabel(fmt.Sprintf("Finding pods... (%d/%d)", done, total)))
 		if !item.ok {
 			errCount++
 		}
@@ -626,8 +629,9 @@ func runPhase1Clean(apps []string, namespace string, tracker *progress.Tracker) 
 func runPhase2Clean(pods []appPod, namespace string, tracker *progress.Tracker) []podContainers {
 	var mu sync.Mutex
 	var result []podContainers
-	tracker.UpdateTotal(int64(len(pods)))
-	doneCh := make(chan phaseItem, len(pods))
+	total := len(pods)
+	tracker.UpdateTotal(int64(total))
+	doneCh := make(chan phaseItem, total)
 	var wg sync.WaitGroup
 	for _, ap := range pods {
 		ap := ap
@@ -646,10 +650,12 @@ func runPhase2Clean(pods []appPod, namespace string, tracker *progress.Tracker) 
 		}()
 	}
 	go func() { wg.Wait(); close(doneCh) }()
-	errCount := 0
+	errCount, done := 0, 0
 	for range pods {
 		item := <-doneCh
+		done++
 		tracker.Increment(1)
+		tracker.UpdateMessage(cleanLabel(fmt.Sprintf("Fetching containers... (%d/%d)", done, total)))
 		if !item.ok {
 			errCount++
 		}
@@ -671,7 +677,7 @@ func cleanLabel(s string) string {
 
 // displayMonitorClean is like displayMonitor but updates an existing tracker
 // without appending per-stream rows — default mode (use -verbose for detail).
-func displayMonitorClean(streams []*streamState, tracker *progress.Tracker) {
+func displayMonitorClean(streams []*streamState, verbCap string, tracker *progress.Tracker) {
 	total := len(streams)
 	tracker.UpdateTotal(int64(total))
 
@@ -688,6 +694,7 @@ func displayMonitorClean(streams []*streamState, tracker *progress.Tracker) {
 			tracker.Increment(1)
 			printed[i] = true
 			doneCount++
+			tracker.UpdateMessage(cleanLabel(fmt.Sprintf("%s logs... (%d/%d)", verbCap, doneCount, total)))
 		}
 	}
 	tracker.MarkAsDone()
@@ -861,7 +868,7 @@ func main() {
 
 	start := time.Now()
 	if !*verbose {
-		displayMonitorClean(streams, cleanT3)
+		displayMonitorClean(streams, verbCap, cleanT3)
 		cleanPW.Stop()
 		activePWMu.Lock()
 		activePW = nil
