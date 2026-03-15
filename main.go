@@ -25,11 +25,12 @@ const (
 	ansiReset  = "\033[0m"
 	ansiGreen  = "\033[32m"
 	ansiYellow = "\033[33m"
-	ansiCyan   = "\033[36m"
 	ansiBold   = "\033[1m"
 	ansiDim    = "\033[2m"
 	ansiClearL = "\033[K"
 	ansiRed    = "\033[31m"
+
+	defaultOutput = "tail_multiple_logs_data.log"
 )
 
 var braille = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -82,12 +83,47 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// ─── Domain types ────────────────────────────────────────────────────────────
+
+// appPod associates a pod name with its owning app label.
+type appPod struct{ app, pod string }
+
+// podContainers holds the container list for a single pod.
+type podContainers struct {
+	app        string
+	pod        string
+	containers []string
+}
+
+// streamConfig holds the shared, read-only parameters for every log stream.
+type streamConfig struct {
+	follow      bool
+	since       string
+	namespace   string
+	grepPattern string
+	outFile     *os.File
+	mu          *sync.Mutex
+}
+
 // ─── Phase monitor (finding pods / fetching containers) ──────────────────────
 
 // phaseItem carries the result of one parallel task once it finishes.
 type phaseItem struct {
 	label  string
 	result string
+}
+
+// printPhaseItem prints a single completed phase item permanently.
+func printPhaseItem(item phaseItem) {
+	cols := termWidth()
+	leftVis := fmt.Sprintf("  ✔  %s", item.label)
+	dimResult := fmt.Sprintf("%s%s%s", ansiDim, item.result, ansiReset)
+	pad := cols - len(leftVis) - len(item.result)
+	if pad < 1 {
+		pad = 1
+	}
+	printPermanent(fmt.Sprintf("  %s✔%s  %s%s%s",
+		ansiGreen, ansiReset, item.label, strings.Repeat(" ", pad), dimResult))
 }
 
 // phaseMonitor prints items permanently as they arrive on doneCh, with a
@@ -98,16 +134,12 @@ func phaseMonitor(total int, doneCh <-chan phaseItem) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	// Drain any items that arrived before the first tick.
+	// drain flushes any items already in the channel buffer.
 	drain := func() {
 		for {
 			select {
 			case item := <-doneCh:
-				cols := termWidth()
-				leftVis := fmt.Sprintf("  ✔  %s", item.label)
-				dimResult := fmt.Sprintf("%s%s%s", ansiDim, item.result, ansiReset)
-				line := rightPad(leftVis, dimResult, cols)
-				printPermanent(fmt.Sprintf("  %s✔%s  %s", ansiGreen, ansiReset, line[5:]))
+				printPhaseItem(item)
 				printed++
 			default:
 				return
@@ -118,21 +150,13 @@ func phaseMonitor(total int, doneCh <-chan phaseItem) {
 	for printed < total {
 		select {
 		case item := <-doneCh:
-			cols := termWidth()
-			leftVis := fmt.Sprintf("  ✔  %s", item.label)
-			dimResult := fmt.Sprintf("%s%s%s", ansiDim, item.result, ansiReset)
-			pad := cols - len(leftVis) - len(item.result)
-			if pad < 1 {
-				pad = 1
-			}
-			printPermanent(fmt.Sprintf("  %s✔%s  %s%s%s", ansiGreen, ansiReset, item.label, strings.Repeat(" ", pad), dimResult))
+			printPhaseItem(item)
 			printed++
 		case <-ticker.C:
 			drain()
-			remaining := total - printed
 			spin := braille[spinIdx%len(braille)]
 			spinIdx++
-			printSpinner(spin, fmt.Sprintf("Waiting for %d more...", remaining))
+			printSpinner(spin, fmt.Sprintf("Waiting for %d more...", total-printed))
 		}
 	}
 	fmt.Printf("\r%s", ansiClearL) // clear spinner line
@@ -205,15 +229,15 @@ func (s *streamState) isFailed() bool      { return s.errMsg != "" }
 
 // ─── Log streaming ────────────────────────────────────────────────────────────
 
-func streamLogs(st *streamState, follow bool, since, namespace, grepPattern string, outFile *os.File, mu *sync.Mutex) {
+func streamLogs(st *streamState, cfg streamConfig) {
 	defer st.markDone()
 
-	args := kubectlArgs(namespace, "logs")
-	if follow {
+	args := kubectlArgs(cfg.namespace, "logs")
+	if cfg.follow {
 		args = append(args, "-f")
 	}
-	if since != "" {
-		args = append(args, "--since="+since)
+	if cfg.since != "" {
+		args = append(args, "--since="+cfg.since)
 	}
 	args = append(args, st.pod, "-c", st.container)
 
@@ -237,26 +261,13 @@ func streamLogs(st *streamState, follow bool, since, namespace, grepPattern stri
 	var batch int64
 	for scanner.Scan() {
 		text := scanner.Text()
-
-		// Apply grep filter if specified
-		if grepPattern != "" && !strings.Contains(strings.ToLower(text), strings.ToLower(grepPattern)) {
-			// Check each pipe-separated pattern
-			matched := false
-			for _, pat := range strings.Split(grepPattern, "|") {
-				if strings.Contains(strings.ToLower(text), strings.ToLower(strings.TrimSpace(pat))) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
+		if cfg.grepPattern != "" && !matchesPattern(text, cfg.grepPattern) {
+			continue
 		}
-
 		line := prefix + text + "\n"
-		mu.Lock()
-		outFile.WriteString(line) //nolint:errcheck
-		mu.Unlock()
+		cfg.mu.Lock()
+		cfg.outFile.WriteString(line) //nolint:errcheck
+		cfg.mu.Unlock()
 		batch++
 		if batch >= 50 {
 			st.addLines(batch)
@@ -267,13 +278,25 @@ func streamLogs(st *streamState, follow bool, since, namespace, grepPattern stri
 		st.addLines(batch)
 	}
 
-	if err := cmd.Wait(); err != nil && st.lineCount() == 0 {
+	if err := cmd.Wait(); err != nil {
 		msg := strings.TrimSpace(stderrBuf.String())
 		if msg == "" {
 			msg = err.Error()
 		}
 		st.setError(truncate(msg, 120))
 	}
+}
+
+// matchesPattern reports whether text contains any of the |-separated patterns
+// (case-insensitive).
+func matchesPattern(text, pattern string) bool {
+	lower := strings.ToLower(text)
+	for _, pat := range strings.Split(pattern, "|") {
+		if strings.Contains(lower, strings.ToLower(strings.TrimSpace(pat))) {
+			return true
+		}
+	}
+	return false
 }
 
 // ─── Display monitor (Phase 3) ────────────────────────────────────────────────
@@ -436,26 +459,31 @@ func main() {
 		since       = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
 		grepPattern = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
 		errorsOnly  = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
-		outputFile  = flag.String("o", "tail_multiple_logs_data.log", "Output file name")
+		outputFile  = flag.String("o", defaultOutput, "Output file name (-o alone uses the default)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  -o alone uses the default filename; -o=myfile.log sets a custom name.\n")
 		flag.PrintDefaults()
 	}
+	flag.Parse()
 
-	// Pre-process os.Args so that bare -o (no attached value) uses the default
-	// filename, matching bash getopts "o::" (optional-argument) behaviour.
-	// -o alone            → -o=tail_multiple_logs_data.log
-	// -o=custom.log       → unchanged (flag package handles it)
-	for i := 1; i < len(os.Args); i++ {
-		if os.Args[i] == "-o" {
-			os.Args[i] = "-o=tail_multiple_logs_data.log"
+	// Bare -o with no value: default is already set by flag package; nothing to do.
+	// If the user passed -o without a filename the flag package would have errored,
+	// so we handle it by scanning for the bare token before Parse.
+	for i, arg := range os.Args[1:] {
+		if arg == "-o" {
+			os.Args[i+1] = "-o=" + defaultOutput
+			// Re-parse with the corrected arg.
+			flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+			namespace = flag.String("n", "", "Kubernetes namespace")
+			since = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
+			grepPattern = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
+			errorsOnly = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
+			outputFile = flag.String("o", defaultOutput, "Output file name")
+			flag.Parse()
 			break
 		}
 	}
-
-	flag.Parse()
 
 	apps := flag.Args()
 	if len(apps) == 0 {
@@ -463,89 +491,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build grep pattern
-	pattern := *grepPattern
-	if *errorsOnly {
-		errorTerms := "ERROR|WARN|Exception|failed|error"
-		if pattern != "" {
-			pattern = pattern + "|" + errorTerms
-		} else {
-			pattern = errorTerms
-		}
-	}
+	pattern := buildPattern(*grepPattern, *errorsOnly)
 
-	// Resolve output file path relative to binary location
 	scriptDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
 	outPath := filepath.Join(scriptDir, *outputFile)
 
-	// ── Phase 1: Find pods ──────────────────────────────────────────────────
-	type appPod struct{ app, pod string }
-	var (
-		appPodsMu sync.Mutex
-		appPods   []appPod
-	)
-
-	fmt.Println("Finding pods for apps...")
-	doneCh1 := make(chan phaseItem, len(apps))
-	var wg1 sync.WaitGroup
-	for _, app := range apps {
-		app := app
-		wg1.Add(1)
-		go func() {
-			defer wg1.Done()
-			pods, err := getPodsForApp(app, *namespace)
-			if err != nil || len(pods) == 0 {
-				doneCh1 <- phaseItem{label: app, result: "no pods found"}
-				return
-			}
-			appPodsMu.Lock()
-			for _, p := range pods {
-				appPods = append(appPods, appPod{app, p})
-			}
-			appPodsMu.Unlock()
-			doneCh1 <- phaseItem{label: app, result: fmt.Sprintf("%d pod(s)", len(pods))}
-		}()
-	}
-	go func() { wg1.Wait(); close(doneCh1) }()
-	phaseMonitor(len(apps), doneCh1)
-
+	// ── Phase 1 & 2 ─────────────────────────────────────────────────────────
+	appPods := runPhase1(apps, *namespace)
 	if len(appPods) == 0 {
 		fmt.Fprintln(os.Stderr, "No pods found for the specified apps. Exiting.")
 		os.Exit(1)
 	}
-
-	// ── Phase 2: Fetch containers ───────────────────────────────────────────
-	type podContainers struct {
-		app        string
-		pod        string
-		containers []string
-	}
-	var (
-		podContainersMu  sync.Mutex
-		allPodContainers []podContainers
-	)
-
-	fmt.Println("Fetching containers for pods...")
-	doneCh2 := make(chan phaseItem, len(appPods))
-	var wg2 sync.WaitGroup
-	for _, ap := range appPods {
-		ap := ap
-		wg2.Add(1)
-		go func() {
-			defer wg2.Done()
-			containers, err := getContainersForPod(ap.pod, *namespace)
-			if err != nil || len(containers) == 0 {
-				doneCh2 <- phaseItem{label: ap.pod, result: "no containers"}
-				return
-			}
-			podContainersMu.Lock()
-			allPodContainers = append(allPodContainers, podContainers{ap.app, ap.pod, containers})
-			podContainersMu.Unlock()
-			doneCh2 <- phaseItem{label: ap.pod, result: fmt.Sprintf("%d container(s)", len(containers))}
-		}()
-	}
-	go func() { wg2.Wait(); close(doneCh2) }()
-	phaseMonitor(len(appPods), doneCh2)
+	allPodContainers := runPhase2(appPods, *namespace)
 
 	// ── Open output file ────────────────────────────────────────────────────
 	outFile, err := os.Create(outPath)
@@ -556,20 +513,26 @@ func main() {
 	defer outFile.Close()
 
 	var fileMu sync.Mutex
+	cfg := streamConfig{
+		follow:      *since == "",
+		since:       *since,
+		namespace:   *namespace,
+		grepPattern: pattern,
+		outFile:     outFile,
+		mu:          &fileMu,
+	}
 
-	follow := *since == ""
-	totalPods := len(appPods)
-	if *since != "" {
-		fmt.Printf("Showing historical logs from %s to now for %d pods and their containers.\n", *since, totalPods)
+	if cfg.since != "" {
+		fmt.Printf("Showing historical logs from %s to now for %d pods and their containers.\n", cfg.since, len(appPods))
 	} else {
-		fmt.Printf("Starting log tailing for %d pods and their containers.\n", totalPods)
+		fmt.Printf("Starting log tailing for %d pods and their containers.\n", len(appPods))
 	}
 	fmt.Printf("Logs are being saved to: %s\n", outPath)
 	fmt.Println("Press Ctrl+C to stop all log streams")
 	fmt.Println("----------------------------------------")
 
-	// ── Set up signal handler for clean shutdown ────────────────────────────
-	var streamsStore atomic.Value // stores []*streamState once Phase 3 is ready
+	// ── Signal handler ──────────────────────────────────────────────────────
+	var streamsStore atomic.Value
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -584,10 +547,98 @@ func main() {
 	}()
 
 	// ── Phase 3: Stream logs ────────────────────────────────────────────────
-	var streams []*streamState
-	var wg3 sync.WaitGroup
+	streams, wg := launchStreams(allPodContainers, cfg)
+	streamsStore.Store(streams)
 
-	// Show prep spinner while goroutines are being launched
+	displayMonitor(streams, cfg.since)
+	wg.Wait()
+
+	printSummary(streams)
+	if cfg.since != "" {
+		fmt.Printf("Historical logs collection completed. Logs saved to: %s\n", outPath)
+	}
+}
+
+// buildPattern merges the user grep pattern with the errors-only terms.
+func buildPattern(grepPattern string, errorsOnly bool) string {
+	if !errorsOnly {
+		return grepPattern
+	}
+	const errorTerms = "ERROR|WARN|Exception|failed|error"
+	if grepPattern != "" {
+		return grepPattern + "|" + errorTerms
+	}
+	return errorTerms
+}
+
+// runPhase1 finds all pods for the given apps in parallel and returns
+// the (app, pod) pairs. The progress is displayed via phaseMonitor.
+func runPhase1(apps []string, namespace string) []appPod {
+	var mu sync.Mutex
+	var result []appPod
+
+	fmt.Println("Finding pods for apps...")
+	doneCh := make(chan phaseItem, len(apps))
+	var wg sync.WaitGroup
+	for _, app := range apps {
+		app := app
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pods, err := getPodsForApp(app, namespace)
+			if err != nil || len(pods) == 0 {
+				doneCh <- phaseItem{label: app, result: "no pods found"}
+				return
+			}
+			mu.Lock()
+			for _, p := range pods {
+				result = append(result, appPod{app, p})
+			}
+			mu.Unlock()
+			doneCh <- phaseItem{label: app, result: fmt.Sprintf("%d pod(s)", len(pods))}
+		}()
+	}
+	go func() { wg.Wait(); close(doneCh) }()
+	phaseMonitor(len(apps), doneCh)
+	return result
+}
+
+// runPhase2 fetches containers for every pod in parallel and returns
+// the full pod→containers mapping. The progress is displayed via phaseMonitor.
+func runPhase2(pods []appPod, namespace string) []podContainers {
+	var mu sync.Mutex
+	var result []podContainers
+
+	fmt.Println("Fetching containers for pods...")
+	doneCh := make(chan phaseItem, len(pods))
+	var wg sync.WaitGroup
+	for _, ap := range pods {
+		ap := ap
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			containers, err := getContainersForPod(ap.pod, namespace)
+			if err != nil || len(containers) == 0 {
+				doneCh <- phaseItem{label: ap.pod, result: "no containers"}
+				return
+			}
+			mu.Lock()
+			result = append(result, podContainers{ap.app, ap.pod, containers})
+			mu.Unlock()
+			doneCh <- phaseItem{label: ap.pod, result: fmt.Sprintf("%d container(s)", len(containers))}
+		}()
+	}
+	go func() { wg.Wait(); close(doneCh) }()
+	phaseMonitor(len(pods), doneCh)
+	return result
+}
+
+// launchStreams starts one goroutine per pod/container, preceded by a prep
+// spinner. Returns the stream list and the WaitGroup for callers to Wait on.
+func launchStreams(allPodContainers []podContainers, cfg streamConfig) ([]*streamState, *sync.WaitGroup) {
+	var streams []*streamState
+	var wg sync.WaitGroup
+
 	prepDone := make(chan struct{})
 	go func() {
 		i := 0
@@ -607,24 +658,14 @@ func main() {
 		for _, container := range pc.containers {
 			st := &streamState{app: pc.app, pod: pc.pod, container: container}
 			streams = append(streams, st)
-			wg3.Add(1)
+			wg.Add(1)
 			go func(st *streamState) {
-				defer wg3.Done()
-				streamLogs(st, follow, *since, *namespace, pattern, outFile, &fileMu)
+				defer wg.Done()
+				streamLogs(st, cfg)
 			}(st)
 		}
 	}
 
-	// Publish streams for the signal handler before starting the monitor
-	streamsStore.Store(streams)
-
-	// Run display monitor in foreground; wait for all streams after
 	close(prepDone)
-	displayMonitor(streams, *since)
-	wg3.Wait()
-
-	printSummary(streams)
-	if *since != "" {
-		fmt.Printf("Historical logs collection completed. Logs saved to: %s\n", outPath)
-	}
+	return streams, &wg
 }
