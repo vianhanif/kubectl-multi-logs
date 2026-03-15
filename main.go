@@ -85,19 +85,26 @@ type streamConfig struct {
 type phaseItem struct {
 	label  string
 	result string
+	ok     bool
 }
 
 // printPhaseItem prints a single completed phase item permanently.
 func printPhaseItem(item phaseItem) {
 	cols := termWidth()
-	checkmark := text.FgGreen.Sprint("✔")
-	leftVis := fmt.Sprintf("  ✔  %s", item.label)
+	var icon, leftVis string
+	if item.ok {
+		icon = text.FgGreen.Sprint("✔")
+		leftVis = fmt.Sprintf("  ✔  %s", item.label)
+	} else {
+		icon = text.FgRed.Sprint("✗")
+		leftVis = fmt.Sprintf("  ✗  %s", item.label)
+	}
 	rightVis := text.FgHiBlack.Sprint(item.result)
 	pad := cols - len(leftVis) - len(item.result)
 	if pad < 1 {
 		pad = 1
 	}
-	printPermanent(fmt.Sprintf("  %s  %s%s%s", checkmark, item.label, strings.Repeat(" ", pad), rightVis))
+	printPermanent(fmt.Sprintf("  %s  %s%s%s", icon, item.label, strings.Repeat(" ", pad), rightVis))
 }
 
 // phaseMonitor prints items permanently as they arrive on doneCh, with a
@@ -711,7 +718,7 @@ func runPhase1(apps []string, namespace string) []appPod {
 	var mu sync.Mutex
 	var result []appPod
 
-	fmt.Println("Finding pods for apps...")
+	fmt.Println(text.Bold.Sprint("Finding pods for apps..."))
 	doneCh := make(chan phaseItem, len(apps))
 	var wg sync.WaitGroup
 	for _, app := range apps {
@@ -721,7 +728,7 @@ func runPhase1(apps []string, namespace string) []appPod {
 			defer wg.Done()
 			pods, err := getPodsForApp(app, namespace)
 			if err != nil || len(pods) == 0 {
-				doneCh <- phaseItem{label: app, result: "no pods found"}
+				doneCh <- phaseItem{label: app, result: "no pods found", ok: false}
 				return
 			}
 			mu.Lock()
@@ -729,7 +736,7 @@ func runPhase1(apps []string, namespace string) []appPod {
 				result = append(result, appPod{app, p})
 			}
 			mu.Unlock()
-			doneCh <- phaseItem{label: app, result: fmt.Sprintf("%d pod(s)", len(pods))}
+			doneCh <- phaseItem{label: app, result: fmt.Sprintf("%d pod(s)", len(pods)), ok: true}
 		}()
 	}
 	go func() { wg.Wait(); close(doneCh) }()
@@ -743,7 +750,7 @@ func runPhase2(pods []appPod, namespace string) []podContainers {
 	var mu sync.Mutex
 	var result []podContainers
 
-	fmt.Println("Fetching containers for pods...")
+	fmt.Println(text.Bold.Sprint("Fetching containers for pods..."))
 	doneCh := make(chan phaseItem, len(pods))
 	var wg sync.WaitGroup
 	for _, ap := range pods {
@@ -753,13 +760,13 @@ func runPhase2(pods []appPod, namespace string) []podContainers {
 			defer wg.Done()
 			containers, err := getContainersForPod(ap.pod, namespace)
 			if err != nil || len(containers) == 0 {
-				doneCh <- phaseItem{label: ap.pod, result: "no containers"}
+				doneCh <- phaseItem{label: ap.pod, result: "no containers", ok: false}
 				return
 			}
 			mu.Lock()
 			result = append(result, podContainers{ap.app, ap.pod, containers})
 			mu.Unlock()
-			doneCh <- phaseItem{label: ap.pod, result: fmt.Sprintf("%d container(s)", len(containers))}
+			doneCh <- phaseItem{label: ap.pod, result: fmt.Sprintf("%d container(s)", len(containers)), ok: true}
 		}()
 	}
 	go func() { wg.Wait(); close(doneCh) }()
