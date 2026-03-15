@@ -52,9 +52,11 @@ kubectl-multi-logs [-n namespace] [-s since] [-g pattern] [-e] [-o [output_file]
 |---|---|---|
 | `-n` | Kubernetes namespace | current context |
 | `-s` | Historical logs since (e.g. `10m`, `1h`, `2d`) | follow live |
+| `-T` | Per-stream timeout in collect mode (`-s`); `0` = no limit | `2m` |
 | `-g` | Filter lines — case-insensitive, `\|` for OR | none |
 | `-e` | Filter for `ERROR\|WARN\|Exception\|failed\|error` | off |
 | `-o` | Output file name (`-o` alone uses default) | `tail_multiple_logs_data.log` |
+| `-verbose` | Show per-pod/container rows during progress (default: compact 3-bar view) | off |
 
 ## Examples
 
@@ -178,6 +180,17 @@ Each log line is prefixed with `[pod:container]` for easy identification:
 ## Bash version
 
 The original bash implementation is kept at [`versions/bash/tail_multiple_logs.sh`](versions/bash/tail_multiple_logs.sh) for reference. It has the same flags and behaviour but uses background subshells and temp files for concurrency.
+
+## Code layout
+
+| File | Responsibility |
+|---|---|
+| `main.go` | Flag parsing, output-file setup, signal handler, top-level orchestration |
+| `kubectl.go` | Domain types (`appPod`, `podContainers`) and `kubectl` helper functions |
+| `phases.go` | Parallel pod/container discovery workers (`findPods`, `fetchContainers`) and the four phase runners (`runPhase1`, `runPhase2`, `runPhase1Clean`, `runPhase2Clean`) |
+| `stream.go` | `streamState`, `streamConfig`, `streamLogs`, `matchesPattern`, `launchStreams` |
+| `progress.go` | `newPW`, `phaseMonitor`, `displayMonitor`, `displayMonitorClean`, `cleanLabel`, `activeStop` |
+| `summary.go` | `printSummary` — hierarchical tree output using go-pretty/list |
 
 ## Contributing
 
