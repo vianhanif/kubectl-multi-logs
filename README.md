@@ -1,96 +1,90 @@
 # kubectl-multi-logs
 
-A Bash script to efficiently collect and tail logs from multiple Kubernetes pods across different applications. Simplify log monitoring by aggregating logs from all replicas into a single, organized output—perfect for debugging distributed systems.
+Tail logs from multiple Kubernetes pods simultaneously — real-time or historical — with a Homebrew-style live progress display.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Features
 
-- **Parallel Log Collection**: Fetches logs from multiple pods concurrently for faster processing.
-- **Replica Coverage**: Automatically includes all replicas of specified apps.
-- **Real-Time & Historical Modes**: Tail logs live or retrieve historical logs from a specified time.
-- **Flexible Filtering**: Filter by patterns or focus on error logs (ERROR, WARN, etc.).
-- **Organized Output**: Prefixes logs with `[pod:container]` for easy identification.
-- **Always Saved to File**: Logs are always written to an output file for later analysis.
-- **Brew-style Live Progress**: Scroll-and-advance terminal UI — each pod/container prints a permanent ✔ line (with line count) as it completes, grouped by app, with a live spinner showing remaining streams. No duplication, no cursor-jumping.
-- **Cross-Platform**: Compatible with bash/zsh; works on macOS/Linux.
-
-## Benefits
-
-- **No Multiple Terminal Tabs**: Aggregate logs into one stream or file, reducing clutter and boosting productivity.
-- **Copilot-Ready Debugging**: Output files can be analyzed by AI tools like GitHub Copilot for correlating issues across pods and replicas.
-- **Comprehensive Coverage**: Ensures no pod or replica is missed during troubleshooting.
-- **Speed & Efficiency**: Parallel processing cuts down collection time for large deployments.
-- **Zero Duplication**: Scroll-and-advance UI means every status line is printed exactly once.
-- **Flexible Workflows**: Supports background saving, filtering, and integration with shell aliases.
+- **Parallel execution**: Pod lookups, container fetches, and log streams run concurrently via goroutines.
+- **Replica coverage**: Automatically includes all replicas of each app.
+- **Real-time & historical modes**: Follow logs live or retrieve from a relative time (`10m`, `1h`, `2d`).
+- **Flexible filtering**: Case-insensitive pattern matching with `|` OR support; dedicated `-e` flag for errors.
+- **Organised output**: Lines prefixed with `[pod:container]` for easy grepping.
+- **Brew-style live progress**: Scroll-and-advance terminal UI — each item prints a permanent ✔ line as it completes, grouped by app, with a live spinner for remaining streams.
+- **Single binary**: No shell runtime required — just `kubectl` on `$PATH`.
 
 ## Installation
 
-1. Clone or download the repository:
-   ```bash
-   git clone https://github.com/yourusername/kubectl-multi-logs.git
-   cd kubectl-multi-logs
-   ```
-
-2. Make the script executable:
-   ```bash
-   chmod +x tail_multiple_logs.sh
-   ```
-
-3. Ensure `kubectl` is installed and configured for your cluster.
-
-### Optional: Add to Shell Profile
-
-Add an alias to your `~/.zshrc` (or `~/.bashrc`) for quick access:
+**Prerequisites**: Go 1.21+ and `kubectl` configured on `$PATH`.
 
 ```bash
-app_logs () {
-    ~/Documents/tail_multiple_logs.sh "$@" -- app-1 app-2
+git clone https://github.com/vianhanif/kubectl-multi-logs.git
+cd kubectl-multi-logs
+go build -o kubectl-multi-logs .
+```
+
+To install as a `kubectl` plugin (enables `kubectl multi-logs`):
+
+```bash
+cp kubectl-multi-logs /usr/local/bin/kubectl-multi-logs
+```
+
+### Shell alias
+
+```bash
+mylogs () {
+    ~/path/to/kubectl-multi-logs "$@" app-1 app-2 app-3
 }
 ```
 
-Reload your shell: `source ~/.zshrc`. Now use `app_logs` instead of the full path.
-
 ## Usage
 
-```bash
-./tail_multiple_logs.sh [-n namespace] [-s since] [-g grep_pattern] [-e] [-o [output_file]] <app1> <app2> ...
+```
+kubectl-multi-logs [-n namespace] [-s since] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...
 ```
 
 ### Options
 
-- `-n namespace`: Kubernetes namespace (default: current context).
-- `-s since`: Historical logs from relative time (e.g., `10m`, `1h`, `1d`). Omits for real-time tailing.
-- `-g pattern`: Filter logs containing the pattern (case-insensitive).
-- `-e`: Filter for error-related logs (ERROR, WARN, Exception, failed, error).
-- `-o [output_file]`: Output file name (default: `tail_multiple_logs_data.log`) and enable quiet mode.
+| Flag | Description | Default |
+|---|---|---|
+| `-n` | Kubernetes namespace | current context |
+| `-s` | Historical logs since (e.g. `10m`, `1h`, `2d`) | follow live |
+| `-g` | Filter lines — case-insensitive, `\|` for OR | none |
+| `-e` | Filter for `ERROR\|WARN\|Exception\|failed\|error` | off |
+| `-o` | Output file name (`-o` alone uses default) | `tail_multiple_logs_data.log` |
 
 ## Examples
 
-To discover available app names in your cluster, run:
+To discover available app names in your cluster:
 
 ```bash
 kubectl get pods -o jsonpath='{.items[*].metadata.labels.app}' | tr ' ' '\n' | sort | uniq
 ```
 
-- Tail real-time logs from `agent-service` and `tez-api`:
+- Follow live logs from `agent-service` and `tez-api`:
   ```bash
-  ./tail_multiple_logs.sh agent-service tez-api
+  kubectl-multi-logs agent-service tez-api
   ```
 
-- Get last 30 minutes of logs for `agent-service` and save to file:
+- Last 30 minutes of logs, errors only:
   ```bash
-  ./tail_multiple_logs.sh -s 30m -o agent-service
+  kubectl-multi-logs -s 30m -e agent-service
   ```
 
-- Filter errors from `tez-api` in `production` namespace:
+- Filter errors in `production` namespace:
   ```bash
-  ./tail_multiple_logs.sh -n production -e tez-api
+  kubectl-multi-logs -n production -e tez-api
   ```
 
-- Search for "ERROR" across apps and save to custom file:
+- Search for a pattern across apps and save to custom file:
   ```bash
-  ./tail_multiple_logs.sh -g ERROR -o custom_logs.log agent-service tez-api
+  kubectl-multi-logs -g ERROR -o custom_logs.log agent-service tez-api
+  ```
+
+- Use `-o` alone to write to the default file:
+  ```bash
+  kubectl-multi-logs -s 15m -o agent-service tez-api
   ```
 
 ## Example Output
@@ -153,10 +147,12 @@ Each log line is prefixed with `[pod:container]` for easy identification:
 [tez-api-6f8b9c7d4-pq5rs:tez-api] 2026-02-18 10:23:05 INFO  Successfully retried request for policy #98712
 ```
 
-> **Tip**: This output file can be shared with GitHub Copilot or other AI tools to analyze and correlate errors across pods—no need to manually cross-reference logs from different terminals.
-> <img width="1680" height="1050" alt="Screenshot 2026-02-18 at 11 33 35 PM" src="https://github.com/user-attachments/assets/0b9088d6-9db3-48a8-bf89-8bf143832bb6" />
+> **Tip**: This output file can be shared with GitHub Copilot or other AI tools to analyze and correlate errors across pods.
+> <img width="1680" height="1050" alt="Screenshot 2026-02-18 at 11 33 35 PM" src="https://github.com/user-attachments/assets/0b9088d6-9db3-48a8-bf89-8bf143832bb6" />
 
-This lists unique app labels from all pods, helping you identify apps to monitor.
+## Bash version
+
+The original bash implementation is kept at [`versions/bash/tail_multiple_logs.sh`](versions/bash/tail_multiple_logs.sh) for reference. It has the same flags and behaviour but uses background subshells and temp files for concurrency.
 
 ## Contributing
 
