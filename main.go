@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jedib0t/go-pretty/v6/list"
 	"github.com/jedib0t/go-pretty/v6/progress"
-	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 )
 
@@ -448,48 +448,8 @@ func displayMonitor(streams []*streamState, since string) {
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
-// longestCommonPrefix returns the longest common prefix of all strings in ss.
-func longestCommonPrefix(ss []string) string {
-	if len(ss) == 0 {
-		return ""
-	}
-	prefix := ss[0]
-	for _, s := range ss[1:] {
-		for !strings.HasPrefix(s, prefix) {
-			prefix = prefix[:len(prefix)-1]
-			if prefix == "" {
-				return ""
-			}
-		}
-	}
-	return prefix
-}
-
-// summaryTableStyle is the go-pretty table style used for the summary.
-var summaryTableStyle = table.Style{
-	Name: "Summary",
-	Box:  table.StyleBoxRounded,
-	Color: table.ColorOptions{
-		Header:    text.Colors{text.Bold},
-		Footer:    text.Colors{text.Bold},
-		Border:    text.Colors{text.FgHiBlack},
-		Separator: text.Colors{text.FgHiBlack},
-	},
-	Format: table.FormatOptions{
-		Header: text.FormatUpper,
-		Footer: text.FormatDefault,
-	},
-	Options: table.Options{
-		DrawBorder:      true,
-		SeparateColumns: true,
-		SeparateHeader:  true,
-		SeparateRows:    false,
-	},
-}
-
-// printSummary prints a single unified table for all apps/pods/containers,
-// with an aggregate row per app group (AutoMerge on the APP column keeps the
-// app name visible once per group) and a grand-total footer.
+// printSummary prints a hierarchical tree summary: app → pod → container,
+// using go-pretty/list for the tree rendering with stats inline per container.
 func printSummary(streams []*streamState) {
 	if len(streams) == 0 {
 		return
@@ -545,93 +505,77 @@ func printSummary(streams []*streamState) {
 	fmt.Println(text.Bold.Sprint("── Summary"))
 	fmt.Println()
 
-	t := table.NewWriter()
-	t.SetOutputMirror(os.Stdout)
-	t.SetStyle(summaryTableStyle)
-	// APP column uses AutoMerge so the app name spans the aggregate row + all
-	// stream rows for that app — each group is fenced by AppendSeparator().
-	t.SetColumnConfigs([]table.ColumnConfig{
-		{Number: 1, Align: text.AlignCenter},
-		{Number: 2, Align: text.AlignLeft, AutoMerge: true, Colors: text.Colors{text.Bold}, WidthMax: 36},
-		{Number: 3, Align: text.AlignLeft},
-		{Number: 4, Align: text.AlignLeft},
-		{Number: 5, Align: text.AlignRight},
-		{Number: 6, Align: text.AlignCenter},
-	})
-	t.AppendHeader(table.Row{" ", "APP", "POD", "CONTAINER", "LINES", "TIME RANGE"})
+	lw := list.NewWriter()
+	lw.SetOutputMirror(os.Stdout)
+	lw.SetStyle(list.StyleConnectedRounded)
 
-	for i, app := range appOrder {
+	for _, app := range appOrder {
 		g := groups[app]
 
-		// Build aggregate note for the group header row.
-		aggNote := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s)", len(g.pods), len(g.containers))
-		var notices []string
+		// App-level item: bold name + dim aggregate + optional error notices.
+		appMeta := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s) · %d lines",
+			len(g.pods), len(g.containers), g.lines)
 		if g.errors > 0 {
-			notices = append(notices, text.FgRed.Sprintf("%d err", g.errors))
+			appMeta += "  " + text.FgRed.Sprintf("%d err", g.errors)
 		}
 		if g.timedOuts > 0 {
-			notices = append(notices, text.FgYellow.Sprintf("%d timed out", g.timedOuts))
+			appMeta += "  " + text.FgYellow.Sprintf("%d timed out", g.timedOuts)
 		}
-		noticeStr := strings.Join(notices, "  ")
+		lw.AppendItem(text.Bold.Sprint(app) + "  " + appMeta)
+		lw.Indent()
 
-		// Aggregate row — APP value here is the same string used in stream
-		// rows so AutoMerge collapses them into one spanning cell.
-		t.AppendRow(table.Row{
-			"",
-			app,
-			aggNote,
-			"",
-			text.FgHiBlack.Sprint(g.lines),
-			noticeStr,
-		})
-
-		// Individual stream rows.
+		// Group containers by pod, preserving sorted order.
+		var podOrder []string
+		podMap := map[string][]*streamState{}
 		for _, st := range g.containers {
-			var icon string
-			if st.isFailed() {
-				icon = text.FgRed.Sprint("✗")
-			} else if st.isTimedOut() {
-				icon = text.FgYellow.Sprint("⏱")
-			} else {
-				icon = text.FgGreen.Sprint("✔")
+			if _, ok := podMap[st.pod]; !ok {
+				podOrder = append(podOrder, st.pod)
 			}
-			timeRange := ""
-			if !st.startedAt.IsZero() {
-				timeRange = text.FgHiBlack.Sprintf("%s → %s",
-					st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
-				if st.isTimedOut() {
-					timeRange += text.FgYellow.Sprint(" (cut)")
-				}
-			} else if st.isFailed() {
-				timeRange = text.FgRed.Sprint(truncate(st.errMsg, 30))
-			}
-			t.AppendRow(table.Row{
-				icon,
-				app,
-				text.FgCyan.Sprint(st.pod),
-				text.FgCyan.Sprint(st.container),
-				st.lineCount(),
-				timeRange,
-			})
+			podMap[st.pod] = append(podMap[st.pod], st)
 		}
 
-		// Separator between app groups (skip after the last one).
-		if i < len(appOrder)-1 {
-			t.AppendSeparator()
+		for _, pod := range podOrder {
+			lw.AppendItem(text.FgHiBlack.Sprint(pod))
+			lw.Indent()
+			for _, st := range podMap[pod] {
+				var icon string
+				if st.isFailed() {
+					icon = text.FgRed.Sprint("✗")
+				} else if st.isTimedOut() {
+					icon = text.FgYellow.Sprint("⏱")
+				} else {
+					icon = text.FgGreen.Sprint("✔")
+				}
+				timeRange := ""
+				if !st.startedAt.IsZero() {
+					timeRange = text.FgHiBlack.Sprintf("%s → %s",
+						st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
+					if st.isTimedOut() {
+						timeRange += text.FgYellow.Sprint(" (cut)")
+					}
+				} else if st.isFailed() {
+					timeRange = text.FgRed.Sprint(truncate(st.errMsg, 40))
+				}
+				lw.AppendItem(fmt.Sprintf("%s  %s  %s  %s",
+					icon,
+					text.FgCyan.Sprint(st.container),
+					text.Bold.Sprintf("%d lines", st.lineCount()),
+					timeRange,
+				))
+			}
+			lw.UnIndent()
 		}
+
+		lw.UnIndent()
 	}
 
-	// Grand-total footer.
-	t.AppendFooter(table.Row{
-		"",
+	lw.Render()
+
+	fmt.Printf("\n  %s  %s\n\n",
 		text.Bold.Sprint("TOTAL"),
-		text.FgHiBlack.Sprintf("%d pod(s)", totalPods),
-		text.FgHiBlack.Sprintf("%d stream(s)", totalContainers),
-		text.Bold.Sprint(totalLines),
-		"",
-	})
-	t.Render()
-	fmt.Println()
+		text.FgHiBlack.Sprintf("%d app(s) · %d pod(s) · %d stream(s) · %d lines",
+			len(appOrder), totalPods, totalContainers, totalLines),
+	)
 }
 
 // ─── Clean-mode helpers ──────────────────────────────────────────────────────
