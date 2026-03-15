@@ -563,19 +563,7 @@ func printSummary(streams []*streamState) {
 	for i, app := range appOrder {
 		g := groups[app]
 
-		// Strip common pod-name prefix to keep the POD column narrow.
-		allPodNames := make([]string, len(g.containers))
-		for j, st := range g.containers {
-			allPodNames[j] = st.pod
-		}
-		podPrefix := longestCommonPrefix(allPodNames)
-		if len(podPrefix) > 0 && len(podPrefix) >= len(allPodNames[0])-1 {
-			podPrefix = ""
-		}
-
 		// Build aggregate note for the group header row.
-		// Prefix is intentionally omitted here — it's implicit from the short
-		// suffixes shown in the stream rows, and including it widens the table.
 		aggNote := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s)", len(g.pods), len(g.containers))
 		var notices []string
 		if g.errors > 0 {
@@ -598,8 +586,7 @@ func printSummary(streams []*streamState) {
 		})
 
 		// Individual stream rows.
-		for j, st := range g.containers {
-			shortPod := strings.TrimPrefix(allPodNames[j], podPrefix)
+		for _, st := range g.containers {
 			var icon string
 			if st.isFailed() {
 				icon = text.FgRed.Sprint("✗")
@@ -621,7 +608,7 @@ func printSummary(streams []*streamState) {
 			t.AppendRow(table.Row{
 				icon,
 				app,
-				text.FgCyan.Sprint(shortPod),
+				text.FgCyan.Sprint(st.pod),
 				text.FgCyan.Sprint(st.container),
 				st.lineCount(),
 				timeRange,
@@ -731,16 +718,18 @@ func runPhase2Clean(pods []appPod, namespace string, tracker *progress.Tracker) 
 	return result
 }
 
+// cleanLabel returns a bold, fixed-width label for clean-mode progress bars
+// so all three bars start at the same horizontal column.
+func cleanLabel(s string) string {
+	const labelWidth = 24
+	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", labelWidth, s)))
+}
+
 // displayMonitorClean is like displayMonitor but updates an existing tracker
-// without appending per-stream rows — used by -clean mode.
-func displayMonitorClean(streams []*streamState, since string, tracker *progress.Tracker) {
+// without appending per-stream rows — default mode (use -verbose for detail).
+func displayMonitorClean(streams []*streamState, tracker *progress.Tracker) {
 	total := len(streams)
 	tracker.UpdateTotal(int64(total))
-	verbCap := "Collecting"
-	if since == "" {
-		verbCap = "Following"
-	}
-	tracker.UpdateMessage(fmt.Sprintf("  %s  (0 / %d)", text.Bold.Sprint(verbCap+" logs..."), total))
 
 	printed := make([]bool, total)
 	doneCount := 0
@@ -756,10 +745,6 @@ func displayMonitorClean(streams []*streamState, since string, tracker *progress
 			printed[i] = true
 			doneCount++
 		}
-		if doneCount < total {
-			tracker.UpdateMessage(fmt.Sprintf("  %s  (%d / %d)",
-				text.Bold.Sprint(verbCap+" logs..."), doneCount, total))
-		}
 	}
 	tracker.MarkAsDone()
 }
@@ -774,7 +759,7 @@ func main() {
 		errorsOnly    = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
 		outputFile    = flag.String("o", defaultOutput, "Output file name (-o alone uses the default)")
 		streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
-		clean         = flag.Bool("clean", false, "Show only 3 high-level progress bars (no per-item detail)")
+		verbose       = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
@@ -796,7 +781,7 @@ func main() {
 			errorsOnly = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
 			outputFile = flag.String("o", defaultOutput, "Output file name")
 			streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
-			clean = flag.Bool("clean", false, "Show only 3 high-level progress bars (no per-item detail)")
+			verbose = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
 			flag.Parse()
 			break
 		}
@@ -819,24 +804,15 @@ func main() {
 	var cleanPW progress.Writer
 	var cleanT3 *progress.Tracker
 
-	if *clean {
+	if !*verbose {
 		pw := newPW()
 		verbCap := "Collecting"
 		if *since == "" {
 			verbCap = "Following"
 		}
-		t1 := &progress.Tracker{
-			Message: fmt.Sprintf("  %s", text.Bold.Sprint("Finding pods...")),
-			Total:   int64(len(apps)),
-		}
-		t2 := &progress.Tracker{
-			Message: fmt.Sprintf("  %s", text.Bold.Sprint("Fetching containers...")),
-			Total:   0,
-		}
-		t3 := &progress.Tracker{
-			Message: fmt.Sprintf("  %s", text.Bold.Sprint(verbCap+" logs...")),
-			Total:   0,
-		}
+		t1 := &progress.Tracker{Message: cleanLabel("Finding pods..."), Total: int64(len(apps))}
+		t2 := &progress.Tracker{Message: cleanLabel("Fetching containers..."), Total: 0}
+		t3 := &progress.Tracker{Message: cleanLabel(verbCap + " logs..."), Total: 0}
 		pw.AppendTracker(t1)
 		pw.AppendTracker(t2)
 		pw.AppendTracker(t3)
@@ -919,8 +895,8 @@ func main() {
 	streamsStore.Store(streams)
 
 	start := time.Now()
-	if *clean {
-		displayMonitorClean(streams, cfg.since, cleanT3)
+	if !*verbose {
+		displayMonitorClean(streams, cleanT3)
 		cleanPW.Stop()
 		activePWMu.Lock()
 		activePW = nil
