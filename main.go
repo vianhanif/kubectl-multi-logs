@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +25,18 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// ansiStripper wraps an io.Writer and strips ANSI escape sequences before
+// writing, so log files contain clean plain text without color codes.
+type ansiStripper struct{ w io.Writer }
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+func (a ansiStripper) Write(p []byte) (int, error) {
+	clean := ansiRe.ReplaceAll(p, nil)
+	_, err := a.w.Write(clean)
+	return len(p), err // report original len to satisfy io.Writer contract
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -71,7 +84,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: cannot open command log file %s: %v\n", cmdLogPath, err)
 	} else {
 		defer cmdLogF.Close()
-		cliOut = io.MultiWriter(os.Stdout, cmdLogF)
+		cliOut = io.MultiWriter(os.Stdout, ansiStripper{cmdLogF})
 	}
 
 	verbCap := "Collecting"
