@@ -9,11 +9,13 @@ Tail logs from multiple Kubernetes pods simultaneously — real-time or historic
 - **Parallel execution**: Pod lookups, container fetches, and log streams run concurrently via goroutines.
 - **Replica coverage**: Automatically includes all replicas of each app.
 - **Real-time & historical modes**: Follow logs live or retrieve from a relative time (`10m`, `1h`, `2d`).
+- **Previous-instance logs**: Pass `-p` to also collect logs from the container instance that ran before the last restart — useful for crash diagnostics.
 - **Flexible filtering**: Case-insensitive pattern matching with `|` OR support; dedicated `-e` flag for errors.
-- **Organised output**: Lines prefixed with `[pod:container]` for easy grepping.
+- **Organised output**: Lines prefixed with `[pod:container]` (or `[pod:container:prev]` for previous instances).
+- **Accurate time ranges**: Each `kubectl logs` call uses `--timestamps`; the real log timestamp is parsed and used for the `HH:MM:SS → HH:MM:SS` summary range. The timestamp prefix is stripped before writing to the log file so output stays clean.
 - **Brew-style live progress**: Scroll-and-advance terminal UI — each item prints a permanent ✔ line as it completes, grouped by app, with a live spinner for remaining streams.
 - **Fixed semantic coloring**: Pod names are always cyan; container names are plain — consistent and easy to scan without distracting per-app palette shifts.
-- **Exit summary with timestamps**: On completion a per-container summary table shows pod, container, line count, and `HH:MM:SS → HH:MM:SS` first/last log timestamps.
+- **Exit summary with timestamps**: On completion a per-container summary table shows pod, container, line count, and `HH:MM:SS → HH:MM:SS` first/last log timestamps. Previous streams are labelled `:prev`; pods that have never restarted show `–  no previous instance`.
 - **Debug command log**: CLI output (start banner through summary) is always mirrored to `command.log` in the same directory as the binary. The file is overwritten on each run.
 - **Single binary**: No shell runtime required — just `kubectl` on `$PATH`.
 
@@ -44,7 +46,7 @@ mylogs () {
 ## Usage
 
 ```
-kubectl-multi-logs [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...
+kubectl-multi-logs [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-p] [-o [output_file]] <app1> <app2> ...
 ```
 
 ### Options
@@ -56,6 +58,7 @@ kubectl-multi-logs [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o 
 | `-T` | Per-stream timeout in collect mode (`-s`); `0` = no limit | `2m` |
 | `-g` | Filter lines — case-insensitive, `\|` for OR | none |
 | `-e` | Filter for `ERROR\|WARN\|Exception\|failed\|error` | off |
+| `-p` | Also collect logs from the previous container instance (before last restart) | off |
 | `-o` | Output file name (`-o` alone uses default) | `tail_multiple_logs_data.log` |
 | `-verbose` | Show per-pod/container rows during progress (default: compact 3-bar view) | off |
 
@@ -75,6 +78,16 @@ kubectl get pods -o jsonpath='{.items[*].metadata.labels.app}' | tr ' ' '\n' | s
 - Last 30 minutes of logs, errors only:
   ```bash
   kubectl-multi-logs -s 30m -e agent-service
+  ```
+
+- Last 30 minutes, **including logs from before the last restart**:
+  ```bash
+  kubectl-multi-logs -s 30m -p agent-service
+  ```
+
+- Crash investigation — errors from current and previous instance:
+  ```bash
+  kubectl-multi-logs -s 1h -e -p agent-service tez-api
   ```
 
 - Filter errors in `production` namespace:
@@ -182,11 +195,28 @@ Pod names are displayed in **cyan**; container names are in plain text — fixed
 
 The hierarchy is **app → pod → container**. Failed streams show `✗` with a truncated error message instead of line counts and timestamps.
 
-### Log File Output
-
-Each log line is prefixed with `[pod:container]` for easy identification:
+When `-p` is active each container gets an additional row labelled `container:prev`. If the pod has never been restarted that row shows `–  no previous instance` instead of line counts:
 
 ```
+│ my-app  1 pod(s) · 2 stream(s) · 846 lines                      │    │       │                      │
+│   my-app-deployment-7b54bf66c7-abc12                             │    │       │                      │
+│     my-app:prev                                                  │ -  │     0 │ no previous instance │
+│     my-app                                                       │ ✔  │   846 │ 10:12:03 → 10:22:41  │
+```
+
+If the pod **has** been restarted the previous instance shows its own line count and time range:
+
+```
+│     my-app:prev                                                  │ ✔  │   312 │ 09:58:14 → 10:09:57  │
+│     my-app                                                       │ ✔  │   846 │ 10:12:03 → 10:22:41  │
+```
+
+### Log File Output
+
+Each log line is prefixed with `[pod:container]`. When `-p` is used, previous-instance lines carry a `:prev` suffix so they are trivially distinguishable when grepping:
+
+```
+[agent-service-5d4b8f6c9-abc12:agent-service:prev] 2026-02-18 10:08:41 ERROR OOMKilled — container exceeded memory limit
 [agent-service-5d4b8f6c9-abc12:agent-service] 2026-02-18 10:23:01 INFO  Starting request processing for policy #98712
 [agent-service-5d4b8f6c9-abc12:agent-service] 2026-02-18 10:23:01 INFO  Fetching agent data for agent_id=4521
 [agent-service-5d4b8f6c9-xyz34:agent-service] 2026-02-18 10:23:02 INFO  Starting request processing for policy #98713
@@ -198,6 +228,8 @@ Each log line is prefixed with `[pod:container]` for easy identification:
 [tez-api-6f8b9c7d4-xk2mn:celery-worker] 2026-02-18 10:23:05 ERROR Task failed: send_notification ConnectionError
 [tez-api-6f8b9c7d4-pq5rs:tez-api] 2026-02-18 10:23:05 INFO  Successfully retried request for policy #98712
 ```
+
+> The RFC3339 timestamp injected by `kubectl --timestamps` is parsed for the summary time range and then stripped before writing, so the log file always contains clean application log lines.
 
 > **Tip**: This output file can be shared with GitHub Copilot or other AI tools to analyze and correlate errors across pods.
 > <img width="1680" height="1050" alt="Screenshot 2026-02-18 at 11 33 35 PM" src="https://github.com/user-attachments/assets/0b9088d6-9db3-48a8-bf89-8bf143832bb6" />
