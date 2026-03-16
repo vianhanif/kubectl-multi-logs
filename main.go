@@ -56,12 +56,13 @@ func main() {
 		since         = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
 		grepPattern   = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
 		errorsOnly    = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
+		previous      = flag.Bool("p", false, "Also collect logs from previous container instances (before last restart)")
 		outputFile    = flag.String("o", defaultOutputFile, "Output file name (-o alone uses the default)")
 		streamTimeout = flag.Duration("T", defaultStreamTimeout, "Per-stream timeout in collect mode (-s); 0 = no limit")
 		verbose       = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-p] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -135,7 +136,11 @@ func main() {
 		// Update t3 label with the total stream count now that it's known.
 		totalStreams := 0
 		for _, pc := range allPodContainers {
-			totalStreams += len(pc.containers)
+			n := len(pc.containers)
+			if *previous {
+				n *= 2 // current + previous instance per container
+			}
+			totalStreams += n
 		}
 		t3.UpdateMessage(cleanLabel(fmt.Sprintf("%s logs...  (%d streams)", verbCap, totalStreams)))
 	} else {
@@ -164,6 +169,7 @@ func main() {
 		outFile:       outFile,
 		mu:            &fileMu,
 		streamTimeout: *streamTimeout,
+		previous:      *previous,
 	}
 
 	if *verbose {

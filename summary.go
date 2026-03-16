@@ -52,7 +52,11 @@ func printSummary(streams []*streamState, out io.Writer) {
 			if g.containers[i].pod != g.containers[j].pod {
 				return g.containers[i].pod < g.containers[j].pod
 			}
-			return g.containers[i].container < g.containers[j].container
+			if g.containers[i].container != g.containers[j].container {
+				return g.containers[i].container < g.containers[j].container
+			}
+			// For the same container, show the previous instance first.
+			return g.containers[i].isPrev && !g.containers[j].isPrev
 		})
 	}
 
@@ -106,7 +110,9 @@ func printSummary(streams []*streamState, out io.Writer) {
 
 			for _, st := range podMap[pod] {
 				var icon string
-				if st.isFailed() {
+				if st.isSkipped() {
+					icon = text.FgHiBlack.Sprint("-")
+				} else if st.isFailed() {
 					icon = text.FgRed.Sprint("✗")
 				} else if st.isTimedOut() {
 					icon = text.FgYellow.Sprint("⏱")
@@ -115,7 +121,9 @@ func printSummary(streams []*streamState, out io.Writer) {
 				}
 
 				timeRange := ""
-				if !st.startedAt.IsZero() {
+				if st.isSkipped() {
+					timeRange = text.FgHiBlack.Sprint("no previous instance")
+				} else if !st.startedAt.IsZero() {
 					timeRange = text.FgHiBlack.Sprintf("%s → %s",
 						st.startedAt.Format(tsLayout), st.lastAt.Format(tsLayout))
 					if st.isTimedOut() {
@@ -125,9 +133,14 @@ func printSummary(streams []*streamState, out io.Writer) {
 					timeRange = text.FgRed.Sprint(truncate(st.errMsg, truncSummaryErrLen))
 				}
 
+				containerLabel := text.FgCyan.Sprint(st.container)
+				if st.isPrev {
+					containerLabel = text.FgCyan.Sprint(st.container) + text.FgHiBlack.Sprint(":prev")
+				}
+
 				// Container row — indented two levels.
 				tw.AppendRow(table.Row{
-					"    " + text.FgCyan.Sprint(st.container),
+					"    " + containerLabel,
 					icon,
 					text.Bold.Sprintf("%d", st.lineCount()),
 					timeRange,

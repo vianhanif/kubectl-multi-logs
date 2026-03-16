@@ -176,19 +176,27 @@ func displayMonitor(streams []*streamState, since string) {
 				printedApp[st.app] = true
 			}
 			// Stream result tracker.
+			containerLabel := st.container
+			if st.isPrev {
+				containerLabel = st.container + text.FgHiBlack.Sprint(":prev")
+			}
 			var msg string
 			switch {
+			case st.isSkipped():
+				msg = fmt.Sprintf("    [%s] %s  %s",
+					text.FgCyan.Sprint(st.pod), containerLabel,
+					text.FgHiBlack.Sprint("no previous instance"))
 			case st.isFailed():
 				msg = fmt.Sprintf("    [%s] %s  %s",
-					text.FgCyan.Sprint(st.pod), st.container,
+					text.FgCyan.Sprint(st.pod), containerLabel,
 					text.FgRed.Sprint(truncate(st.errMsg, truncErrMsgLen)))
 			case st.isTimedOut():
 				msg = fmt.Sprintf("    [%s] %s  %s",
-					text.FgCyan.Sprint(st.pod), st.container,
+					text.FgCyan.Sprint(st.pod), containerLabel,
 					text.FgYellow.Sprintf("timed out · %d lines", st.lineCount()))
 			default:
 				msg = fmt.Sprintf("    [%s] %s  %s",
-					text.FgCyan.Sprint(st.pod), st.container,
+					text.FgCyan.Sprint(st.pod), containerLabel,
 					text.FgHiBlack.Sprintf("%s · %d lines", verb, st.lineCount()))
 			}
 			t := &progress.Tracker{Message: msg, Total: 0}
