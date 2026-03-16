@@ -13,8 +13,8 @@ import (
 // activeStop holds a func() that stops whichever progress.Writer is currently
 // rendering, so the signal handler can halt it before printing the Ctrl+C banner.
 var (
-	activePWMu  sync.Mutex
-	activeStop  func()
+	activePWMu sync.Mutex
+	activeStop func()
 )
 
 // clearLine erases the current terminal line and moves cursor to column 0.
