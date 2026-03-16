@@ -17,7 +17,7 @@ func printSummary(streams []*streamState) {
 		return
 	}
 
-	const tsLayout = "15:04:05"
+	const tsLayout = summaryTimeLayout
 
 	type appGroup struct {
 		pods       map[string]bool
@@ -122,7 +122,7 @@ func printSummary(streams []*streamState) {
 						timeRange += text.FgYellow.Sprint(" (cut)")
 					}
 				} else if st.isFailed() {
-					timeRange = text.FgRed.Sprint(truncate(st.errMsg, 40))
+					timeRange = text.FgRed.Sprint(truncate(st.errMsg, truncSummaryErrLen))
 				}
 
 				// Container row — indented two levels.

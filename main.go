@@ -15,8 +15,6 @@ import (
 	"github.com/jedib0t/go-pretty/v6/text"
 )
 
-const defaultOutput = "tail_multiple_logs_data.log"
-
 var braille = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // truncate shortens s to at most n bytes, appending "..." if cut.
@@ -41,7 +39,7 @@ func main() {
 	// parse once. The flag package would otherwise error on the next token.
 	for i, arg := range os.Args[1:] {
 		if arg == "-o" {
-			os.Args[i+1] = "-o=" + defaultOutput
+			os.Args[i+1] = "-o=" + defaultOutputFile
 			break
 		}
 	}
@@ -51,8 +49,8 @@ func main() {
 		since         = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
 		grepPattern   = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
 		errorsOnly    = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
-		outputFile    = flag.String("o", defaultOutput, "Output file name (-o alone uses the default)")
-		streamTimeout = flag.Duration("T", 2*time.Minute, "Per-stream timeout in collect mode (-s); 0 = no limit")
+		outputFile    = flag.String("o", defaultOutputFile, "Output file name (-o alone uses the default)")
+		streamTimeout = flag.Duration("T", defaultStreamTimeout, "Per-stream timeout in collect mode (-s); 0 = no limit")
 		verbose       = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
 	)
 	flag.Usage = func() {
@@ -221,11 +219,10 @@ func buildPattern(grepPattern string, errorsOnly bool) string {
 	if !errorsOnly {
 		return grepPattern
 	}
-	const errorTerms = "ERROR|WARN|Exception|failed|error"
 	if grepPattern != "" {
-		return grepPattern + "|" + errorTerms
+		return grepPattern + "|" + defaultErrorTerms
 	}
-	return errorTerms
+	return defaultErrorTerms
 }
 
 

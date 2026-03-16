@@ -63,7 +63,7 @@ func newPW() progress.Writer {
 		TrackerOverall: false,
 	}
 	pw.SetTrackerPosition(progress.PositionRight)
-	pw.SetUpdateFrequency(80 * time.Millisecond)
+	pw.SetUpdateFrequency(progressUpdateFreq)
 	return pw
 }
 
@@ -181,7 +181,7 @@ func displayMonitor(streams []*streamState, since string) {
 			case st.isFailed():
 				msg = fmt.Sprintf("    [%s] %s  %s",
 					text.FgCyan.Sprint(st.pod), st.container,
-					text.FgRed.Sprint(truncate(st.errMsg, 60)))
+					text.FgRed.Sprint(truncate(st.errMsg, truncErrMsgLen)))
 			case st.isTimedOut():
 				msg = fmt.Sprintf("    [%s] %s  %s",
 					text.FgCyan.Sprint(st.pod), st.container,
@@ -214,7 +214,7 @@ func displayMonitor(streams []*streamState, since string) {
 			msg := fmt.Sprintf("  %s logs… (%d / %d done)", verbCap, doneCount, total)
 			if slowest != nil {
 				msg += "  ·  " + text.FgHiBlack.Sprintf("[%s] %s",
-					truncate(slowest.pod, 28), slowest.statusLabel())
+					truncate(slowest.pod, truncPodNameLen), slowest.statusLabel())
 			}
 			overall.UpdateMessage(msg)
 		}
@@ -229,8 +229,7 @@ func displayMonitor(streams []*streamState, since string) {
 // labelWidth is derived from the widest string any of the three phases can
 // produce: "Fetching containers... (999/999)" = 32 chars → padded to 36.
 func cleanLabel(s string) string {
-	const labelWidth = 36
-	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", labelWidth, s)))
+	return fmt.Sprintf("  %s", text.Bold.Sprint(fmt.Sprintf("%-*s", progressLabelWidth, s)))
 }
 
 // displayMonitorClean is like displayMonitor but updates an existing tracker
