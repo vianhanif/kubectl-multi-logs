@@ -80,7 +80,7 @@ func main() {
 	// ── Command log (CLI output mirror for debugging) ────────────────────────
 	var cliOut io.Writer = os.Stdout
 	cmdLogPath := filepath.Join(scriptDir, defaultCommandLogFile)
-	if cmdLogF, err := os.OpenFile(cmdLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
+	if cmdLogF, err := os.OpenFile(cmdLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: cannot open command log file %s: %v\n", cmdLogPath, err)
 	} else {
 		defer cmdLogF.Close()
