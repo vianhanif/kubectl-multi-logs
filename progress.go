@@ -13,8 +13,8 @@ import (
 // activeStop holds a func() that stops whichever progress.Writer is currently
 // rendering, so the signal handler can halt it before printing the Ctrl+C banner.
 var (
-	activePWMu sync.Mutex
-	activeStop func()
+	activePWMu  sync.Mutex
+	activeStop  func()
 )
 
 // clearLine erases the current terminal line and moves cursor to column 0.
@@ -79,9 +79,7 @@ func phaseMonitor(title string, labels []string, doneCh <-chan phaseItem) {
 		Total:   int64(total),
 	}
 	pw.AppendTracker(overall)
-	var renderWg sync.WaitGroup
-	renderWg.Add(1)
-	go func() { defer renderWg.Done(); pw.Render() }()
+	go pw.Render()
 
 	for i := range labels {
 		item := <-doneCh
@@ -107,7 +105,6 @@ func phaseMonitor(title string, labels []string, doneCh <-chan phaseItem) {
 	}
 	overall.MarkAsDone()
 	pw.Stop()
-	renderWg.Wait()
 }
 
 // ─── Display monitor (Phase 3) ────────────────────────────────────────────────
@@ -152,9 +149,7 @@ func displayMonitor(streams []*streamState, since string) {
 		activePWMu.Unlock()
 	}()
 
-	var renderWg sync.WaitGroup
-	renderWg.Add(1)
-	go func() { defer renderWg.Done(); pw.Render() }()
+	go pw.Render()
 
 	printedApp := map[string]bool{}
 	printedStream := make([]bool, total)
@@ -225,7 +220,6 @@ func displayMonitor(streams []*streamState, since string) {
 		}
 	}
 	pw.Stop()
-	renderWg.Wait()
 }
 
 // ─── Clean-mode progress helpers ─────────────────────────────────────────────

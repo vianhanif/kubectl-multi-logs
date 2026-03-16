@@ -81,7 +81,6 @@ func main() {
 	var appPods []appPod
 	var allPodContainers []podContainers
 	var cleanPW progress.Writer
-	var cleanRenderWg sync.WaitGroup
 	var cleanT3 *progress.Tracker
 
 	if !*verbose {
@@ -106,8 +105,7 @@ func main() {
 		activePWMu.Lock()
 		activeStop = pw.Stop
 		activePWMu.Unlock()
-		cleanRenderWg.Add(1)
-		go func() { defer cleanRenderWg.Done(); pw.Render() }()
+		go pw.Render()
 		cleanPW = pw
 		cleanT3 = t3
 
@@ -195,7 +193,6 @@ func main() {
 	if !*verbose {
 		displayMonitorClean(streams, verbCap, cleanT3)
 		cleanPW.Stop()
-		cleanRenderWg.Wait()
 		activePWMu.Lock()
 		activeStop = nil
 		activePWMu.Unlock()
