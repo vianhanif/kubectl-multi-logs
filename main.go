@@ -26,13 +26,6 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-
-
-
-
-
-
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -46,17 +39,16 @@ func main() {
 	}
 
 	var (
-		namespace      = flag.String("n", "", "Kubernetes namespace")
-		since          = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
-		grepPattern    = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
-		errorsOnly     = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
-		outputFile     = flag.String("o", defaultOutputFile, "Output file name (-o alone uses the default)")
-		commandLogFile = flag.String("log", defaultCommandLogFile, "Mirror CLI output to this file for debugging (empty string to disable)")
-		streamTimeout  = flag.Duration("T", defaultStreamTimeout, "Per-stream timeout in collect mode (-s); 0 = no limit")
-		verbose        = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
+		namespace     = flag.String("n", "", "Kubernetes namespace")
+		since         = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
+		grepPattern   = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
+		errorsOnly    = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
+		outputFile    = flag.String("o", defaultOutputFile, "Output file name (-o alone uses the default)")
+		streamTimeout = flag.Duration("T", defaultStreamTimeout, "Per-stream timeout in collect mode (-s); 0 = no limit")
+		verbose       = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] [-log [command_log]] <app1> <app2> ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -74,15 +66,12 @@ func main() {
 
 	// ── Command log (CLI output mirror for debugging) ────────────────────────
 	var cliOut io.Writer = os.Stdout
-	if *commandLogFile != "" {
-		cmdLogPath := filepath.Join(scriptDir, *commandLogFile)
-		cmdLogF, err := os.OpenFile(cmdLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: cannot open command log file %s: %v\n", cmdLogPath, err)
-		} else {
-			defer cmdLogF.Close()
-			cliOut = io.MultiWriter(os.Stdout, cmdLogF)
-		}
+	cmdLogPath := filepath.Join(scriptDir, defaultCommandLogFile)
+	if cmdLogF, err := os.OpenFile(cmdLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: cannot open command log file %s: %v\n", cmdLogPath, err)
+	} else {
+		defer cmdLogF.Close()
+		cliOut = io.MultiWriter(os.Stdout, cmdLogF)
 	}
 
 	verbCap := "Collecting"
@@ -239,5 +228,3 @@ func buildPattern(grepPattern string, errorsOnly bool) string {
 	}
 	return defaultErrorTerms
 }
-
-

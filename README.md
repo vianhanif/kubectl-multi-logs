@@ -14,7 +14,7 @@ Tail logs from multiple Kubernetes pods simultaneously — real-time or historic
 - **Brew-style live progress**: Scroll-and-advance terminal UI — each item prints a permanent ✔ line as it completes, grouped by app, with a live spinner for remaining streams.
 - **Fixed semantic coloring**: Pod names are always cyan; container names are plain — consistent and easy to scan without distracting per-app palette shifts.
 - **Exit summary with timestamps**: On completion a per-container summary table shows pod, container, line count, and `HH:MM:SS → HH:MM:SS` first/last log timestamps.
-- **Debug command log**: Mirror all CLI output (start banner through summary) to a local `command.log` file for debugging — disable with `-log ""`.
+- **Debug command log**: CLI output (start banner through summary) is always mirrored to `command.log` in the same directory as the binary.
 - **Single binary**: No shell runtime required — just `kubectl` on `$PATH`.
 
 ## Installation
@@ -44,7 +44,7 @@ mylogs () {
 ## Usage
 
 ```
-kubectl-multi-logs [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] [-log [command_log]] <app1> <app2> ...
+kubectl-multi-logs [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...
 ```
 
 ### Options
@@ -57,7 +57,6 @@ kubectl-multi-logs [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o 
 | `-g` | Filter lines — case-insensitive, `\|` for OR | none |
 | `-e` | Filter for `ERROR\|WARN\|Exception\|failed\|error` | off |
 | `-o` | Output file name (`-o` alone uses default) | `tail_multiple_logs_data.log` |
-| `-log` | Mirror CLI output to this file for debugging (`-log ""` to disable) | `command.log` |
 | `-verbose` | Show per-pod/container rows during progress (default: compact 3-bar view) | off |
 
 ## Examples
