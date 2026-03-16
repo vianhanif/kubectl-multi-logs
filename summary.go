@@ -71,12 +71,12 @@ func printSummary(streams []*streamState) {
 	tw.SetOutputMirror(os.Stdout)
 	tw.SetStyle(table.StyleRounded)
 	tw.Style().Options.SeparateRows = false
-	tw.AppendHeader(table.Row{"Pod", "Container", "", "Lines", "Time range"})
+	tw.AppendHeader(table.Row{"", "", "Lines", "Time range"})
 
 	for i, app := range appOrder {
 		g := groups[app]
 
-		// App header row — spans the Pod column, rest empty.
+		// App header row.
 		appMeta := text.FgHiBlack.Sprintf("%d pod(s) · %d stream(s) · %d lines", len(g.pods), len(g.containers), g.lines)
 		if g.errors > 0 {
 			appMeta += "  " + text.FgRed.Sprintf("%d err", g.errors)
@@ -85,7 +85,7 @@ func printSummary(streams []*streamState) {
 			appMeta += "  " + text.FgYellow.Sprintf("%d timed out", g.timedOuts)
 		}
 		tw.AppendRow(table.Row{
-			text.Bold.Sprint(app) + "  " + appMeta, "", "", "", "",
+			text.Bold.Sprint(app) + "  " + appMeta, "", "", "",
 		})
 
 		// Group containers by pod, preserving sorted order.
@@ -99,13 +99,12 @@ func printSummary(streams []*streamState) {
 		}
 
 		for _, pod := range podOrder {
-			for rowIdx, st := range podMap[pod] {
-				// Pod name only on the first container row for that pod.
-				podCell := ""
-				if rowIdx == 0 {
-					podCell = text.FgHiBlack.Sprint(pod)
-				}
+			// Pod row — indented one level, no status/lines/time.
+			tw.AppendRow(table.Row{
+				"  " + text.FgHiBlack.Sprint(pod), "", "", "",
+			})
 
+			for _, st := range podMap[pod] {
 				var icon string
 				if st.isFailed() {
 					icon = text.FgRed.Sprint("✗")
@@ -126,9 +125,9 @@ func printSummary(streams []*streamState) {
 					timeRange = text.FgRed.Sprint(truncate(st.errMsg, 40))
 				}
 
+				// Container row — indented two levels.
 				tw.AppendRow(table.Row{
-					podCell,
-					text.FgCyan.Sprint(st.container),
+					"    " + text.FgCyan.Sprint(st.container),
 					icon,
 					text.Bold.Sprintf("%d", st.lineCount()),
 					timeRange,
@@ -141,9 +140,9 @@ func printSummary(streams []*streamState) {
 		}
 	}
 
+	footerMeta := text.FgHiBlack.Sprintf("%d app(s) · %d pod(s) · %d stream(s)", len(appOrder), totalPods, totalContainers)
 	tw.AppendFooter(table.Row{
-		text.Bold.Sprint("TOTAL"),
-		text.FgHiBlack.Sprintf("%d app(s) · %d pod(s) · %d stream(s)", len(appOrder), totalPods, totalContainers),
+		text.Bold.Sprint("TOTAL") + "  " + footerMeta,
 		"", text.Bold.Sprintf("%d", totalLines), "",
 	})
 	tw.Render()
