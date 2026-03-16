@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -45,16 +46,17 @@ func main() {
 	}
 
 	var (
-		namespace     = flag.String("n", "", "Kubernetes namespace")
-		since         = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
-		grepPattern   = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
-		errorsOnly    = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
-		outputFile    = flag.String("o", defaultOutputFile, "Output file name (-o alone uses the default)")
-		streamTimeout = flag.Duration("T", defaultStreamTimeout, "Per-stream timeout in collect mode (-s); 0 = no limit")
-		verbose       = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
+		namespace      = flag.String("n", "", "Kubernetes namespace")
+		since          = flag.String("s", "", "Show logs since (e.g. 10m, 1h)")
+		grepPattern    = flag.String("g", "", "Filter log lines (case-insensitive, supports | for multiple patterns)")
+		errorsOnly     = flag.Bool("e", false, "Filter for ERROR/WARN/Exception/failed/error")
+		outputFile     = flag.String("o", defaultOutputFile, "Output file name (-o alone uses the default)")
+		commandLogFile = flag.String("log", defaultCommandLogFile, "Mirror CLI output to this file for debugging (empty string to disable)")
+		streamTimeout  = flag.Duration("T", defaultStreamTimeout, "Per-stream timeout in collect mode (-s); 0 = no limit")
+		verbose        = flag.Bool("verbose", false, "Show per-item detail during progress (pod names, containers, stream results)")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] <app1> <app2> ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-n namespace] [-s since] [-T timeout] [-g pattern] [-e] [-o [output_file]] [-log [command_log]] <app1> <app2> ...\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -70,6 +72,19 @@ func main() {
 	scriptDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
 	outPath := filepath.Join(scriptDir, *outputFile)
 
+	// ── Command log (CLI output mirror for debugging) ────────────────────────
+	var cliOut io.Writer = os.Stdout
+	if *commandLogFile != "" {
+		cmdLogPath := filepath.Join(scriptDir, *commandLogFile)
+		cmdLogF, err := os.OpenFile(cmdLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: cannot open command log file %s: %v\n", cmdLogPath, err)
+		} else {
+			defer cmdLogF.Close()
+			cliOut = io.MultiWriter(os.Stdout, cmdLogF)
+		}
+	}
+
 	verbCap := "Collecting"
 	if *since == "" {
 		verbCap = "Following"
@@ -84,11 +99,11 @@ func main() {
 	if !*verbose {
 		// Print one-line header before the bars appear.
 		if *since != "" {
-			fmt.Printf("%s  ·  saving to %s\n",
+			fmt.Fprintf(cliOut, "%s  ·  saving to %s\n",
 				text.Bold.Sprintf("Collecting from last %s", *since),
 				text.FgHiBlack.Sprint(outPath))
 		} else {
-			fmt.Printf("%s  ·  saving to %s\n",
+			fmt.Fprintf(cliOut, "%s  ·  saving to %s\n",
 				text.Bold.Sprint("Following live logs"),
 				text.FgHiBlack.Sprint(outPath))
 		}
@@ -151,13 +166,13 @@ func main() {
 
 	if *verbose {
 		if cfg.since != "" {
-			fmt.Printf("Showing historical logs from %s to now for %d pods and their containers.\n", cfg.since, len(appPods))
+			fmt.Fprintf(cliOut, "Showing historical logs from %s to now for %d pods and their containers.\n", cfg.since, len(appPods))
 		} else {
-			fmt.Printf("Starting log tailing for %d pods and their containers.\n", len(appPods))
+			fmt.Fprintf(cliOut, "Starting log tailing for %d pods and their containers.\n", len(appPods))
 		}
-		fmt.Printf("Logs are being saved to: %s\n", outPath)
-		fmt.Println("Press Ctrl+C to stop all log streams")
-		fmt.Println("----------------------------------------")
+		fmt.Fprintf(cliOut, "Logs are being saved to: %s\n", outPath)
+		fmt.Fprintln(cliOut, "Press Ctrl+C to stop all log streams")
+		fmt.Fprintln(cliOut, "----------------------------------------")
 	}
 
 	// ── Signal handler ──────────────────────────────────────────────────────
@@ -175,10 +190,10 @@ func main() {
 			stop()
 		}
 		clearLine()
-		fmt.Printf("\n%s\n", text.FgYellow.Sprint("Ctrl+C received — stopping all log streams..."))
+		fmt.Fprintf(cliOut, "\n%s\n", text.FgYellow.Sprint("Ctrl+C received — stopping all log streams..."))
 		outFile.Close()
 		if v := streamsStore.Load(); v != nil {
-			printSummary(v.([]*streamState))
+			printSummary(v.([]*streamState), cliOut)
 		}
 		os.Exit(0)
 	}()
@@ -203,14 +218,14 @@ func main() {
 	// All N kubectl processes have exited; no hidden work remains.
 	// If one stream ran much longer than the others it is simply the slowest
 	// pod — the -T flag (default 2m) caps any runaway stream.
-	fmt.Printf("%s  %s\n",
+	fmt.Fprintf(cliOut, "%s  %s\n",
 		text.FgGreen.Sprint("✔ All streams finished"),
 		text.FgHiBlack.Sprintf("total elapsed: %s", elapsed),
 	)
 
-	printSummary(streams)
+	printSummary(streams, cliOut)
 	if cfg.since != "" {
-		fmt.Printf("Historical logs collection completed. Logs saved to: %s\n", outPath)
+		fmt.Fprintf(cliOut, "Historical logs collection completed. Logs saved to: %s\n", outPath)
 	}
 }
 

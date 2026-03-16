@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"io"
 	"sort"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -12,7 +12,7 @@ import (
 // printSummary prints a table summary grouped by app.
 // The app name appears as a bold header row in the Pod column; each container
 // stream follows as a data row with pod, container, status, lines, and time range.
-func printSummary(streams []*streamState) {
+func printSummary(streams []*streamState, out io.Writer) {
 	if len(streams) == 0 {
 		return
 	}
@@ -63,12 +63,12 @@ func printSummary(streams []*streamState) {
 		totalLines += g.lines
 	}
 
-	fmt.Println()
-	fmt.Println(text.Bold.Sprint("── Summary"))
-	fmt.Println()
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, text.Bold.Sprint("── Summary"))
+	fmt.Fprintln(out)
 
 	tw := table.NewWriter()
-	tw.SetOutputMirror(os.Stdout)
+	tw.SetOutputMirror(out)
 	tw.SetStyle(table.StyleRounded)
 	tw.Style().Options.SeparateRows = false
 	tw.AppendHeader(table.Row{"", "", "Lines", "Time range"})
@@ -146,5 +146,5 @@ func printSummary(streams []*streamState) {
 		"", text.Bold.Sprintf("%d", totalLines), "",
 	})
 	tw.Render()
-	fmt.Println()
+	fmt.Fprintln(out)
 }

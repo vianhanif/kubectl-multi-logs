@@ -8,6 +8,9 @@ const (
 	// defaultOutputFile is the log file written when -o is not provided.
 	defaultOutputFile = "tail_multiple_logs_data.log"
 
+	// defaultCommandLogFile is the file where CLI output is mirrored for debugging.
+	defaultCommandLogFile = "command.log"
+
 	// defaultStreamTimeout caps each kubectl stream in collect (-s) mode.
 	defaultStreamTimeout = 2 * time.Minute
 
