@@ -14,7 +14,7 @@ Tail logs from multiple Kubernetes pods simultaneously — real-time or historic
 - **Brew-style live progress**: Scroll-and-advance terminal UI — each item prints a permanent ✔ line as it completes, grouped by app, with a live spinner for remaining streams.
 - **Fixed semantic coloring**: Pod names are always cyan; container names are plain — consistent and easy to scan without distracting per-app palette shifts.
 - **Exit summary with timestamps**: On completion a per-container summary table shows pod, container, line count, and `HH:MM:SS → HH:MM:SS` first/last log timestamps.
-- **Debug command log**: CLI output (start banner through summary) is always mirrored to `command.log` in the same directory as the binary.
+- **Debug command log**: CLI output (start banner through summary) is always mirrored to `command.log` in the same directory as the binary. The file is overwritten on each run.
 - **Single binary**: No shell runtime required — just `kubectl` on `$PATH`.
 
 ## Installation
